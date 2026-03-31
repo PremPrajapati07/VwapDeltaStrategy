@@ -35,11 +35,12 @@ REENTRY_ALLOWED             = True
 REENTRY_REEVALUATE_STRIKE   = True          # re-run ML on re-entry
 
 # ── Risk & Reliability ─────────────────────────────────────────
-SL_MULTIPLIER = 2.0                          # stop loss = 2× premium collected
+SL_MULTIPLIER = 2.0
 CHECK_MARGIN  = True                         # check available cash before entry
 MIN_REQUIRED_MARGIN = 150000                 # minimum cash required to trade (approx 1 straddle)
 SL_COOLDOWN_MINUTES = 15                     # wait 15 mins after SL before re-entry
 WAIT_FOR_MARKET_OPEN = True                  # wait until 9:15 AM in live mode
+ARJUN_EXIT_THRESHOLD = 0.55                 # Model Arjun: probability threshold to exit
 
 # ── File Paths (logs & models only — no SQLite) ────────────────
 MODELS_PATH = "models/"
@@ -64,4 +65,17 @@ ML_FEATURES = [
     "vix",
     "nifty_prev_day_change",
     "nifty_open_gap",
+    "ce_iv",
+    "pe_iv",
+    "ce_delta",
+    "pe_delta",
+    "ce_theta",
+    "pe_theta",
+    "ce_gamma",
+    "pe_gamma",
+    "ce_vega",
+    "pe_vega",
+    "delta_spread",
+    "theta_ratio",
+    "vega_imbalance"
 ]

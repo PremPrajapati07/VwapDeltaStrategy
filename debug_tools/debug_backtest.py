@@ -1,6 +1,6 @@
 import pandas as pd
 import db
-import ml_model as ml
+import krishna_model as ml
 import datetime as dt
 
 def debug_backtest():

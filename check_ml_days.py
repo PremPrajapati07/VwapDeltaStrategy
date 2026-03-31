@@ -1,4 +1,4 @@
-import ml_model as ml
+import krishna_model as ml
 import pandas as pd
 
 def check():

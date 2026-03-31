@@ -197,6 +197,37 @@ CREATE TABLE IF NOT EXISTS trade_log (
 );
 CREATE INDEX IF NOT EXISTS idx_trade_log_date
     ON trade_log (trade_date);
+
+-- Phase 2: Arjun Model training data (Sequential)
+CREATE TABLE IF NOT EXISTS arjun_training_data (
+    id                 BIGSERIAL PRIMARY KEY,
+    trade_date         DATE NOT NULL,
+    ts                 TIMESTAMPTZ NOT NULL,
+    strike             INTEGER NOT NULL,
+    pnl_pts            NUMERIC(10,2),
+    max_pnl_so_far     NUMERIC(10,2),
+    drawdown           NUMERIC(10,2),
+    vwap_gap_pct       NUMERIC(10,4),
+    delta_drift        NUMERIC(10,4),
+    theta_velocity     NUMERIC(10,4),
+    iv_drift           NUMERIC(10,4),
+    rel_vol_15m        NUMERIC(10,4),
+    should_exit        BOOLEAN DEFAULT FALSE,
+    UNIQUE (trade_date, ts, strike)
+);
+
+-- Krishna Prediction Log (what the model picked and why)
+CREATE TABLE IF NOT EXISTS krishna_predictions (
+    id                BIGSERIAL PRIMARY KEY,
+    trade_date        DATE UNIQUE NOT NULL,
+    predicted_strike  INTEGER NOT NULL,
+    confidence        NUMERIC(5,4),
+    features_json     JSONB,
+    actual_best_strike INTEGER,
+    prediction_correct BOOLEAN,
+    created_at        TIMESTAMPTZ DEFAULT now()
+);
+
 """
 
 

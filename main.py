@@ -27,40 +27,70 @@ import config
 import db
 import kite_auth
 import data_collector as dc
-import ml_model as ml
+import krishna_model as ml
+import arjun_model
 import live_trader as lt
 
 
 # ── Backtest ─────────────────────────────────────────────────
 
-def run_backtest():
+def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPLIER):
     """
     Full backtest: for each historical Thursday, simulate the strategy
     using VWAP crossover on the strike the ML model would have chosen.
     Prints a detailed P&L report.
     """
-    print("\n📈 Running Backtest …\n")
-    feat_df = ml.build_features_from_db()
+    print(f"\n📈 Running Backtest from {start_date or 'ALL'} to {end_date or 'ALL'} …\n")
+    
+    with db.get_conn() as conn:
+        q_feat = "SELECT * FROM daily_features"
+        q_cand = "SELECT * FROM straddle_candles"
+        if start_date or end_date:
+            conds = []
+            if start_date: conds.append(f"trade_date >= '{start_date}'")
+            if end_date:   conds.append(f"trade_date <= '{end_date}'")
+            where_clause = " WHERE " + " AND ".join(conds)
+            q_feat += where_clause
+            q_cand += where_clause
+        
+        feat_df = pd.read_sql(q_feat, conn)
+        candles = pd.read_sql(q_cand + " ORDER BY trade_date, strike, ts", conn)
+
     if feat_df.empty:
-        print("❌ No data. Run --mode backfill first.")
+        print("❌ No feature data found for these dates. Run --mode train first.")
         return
 
-    with db.get_conn() as conn:
-        candles = pd.read_sql(
-            "SELECT * FROM straddle_candles ORDER BY trade_date, strike, ts", conn
-        )
+    # Ensure numeric types for ALL price and calc columns (Postgres may return Decimals as objects)
+    numeric_cols = [
+        "ce_iv", "pe_iv", "ce_delta", "pe_delta", 
+        "ce_theta", "pe_theta", "ce_gamma", "pe_gamma", 
+        "ce_vega", "pe_vega", "synthetic_spot", "vwap", "vwap_gap_pct",
+        "straddle_price", "ce_close", "pe_close", "ce_oi", "pe_oi", "atm"
+    ]
+    for col in numeric_cols:
+        if col in candles.columns:
+            candles[col] = pd.to_numeric(candles[col], errors="coerce").fillna(0)
+
     candles["ts"] = pd.to_datetime(candles["ts"])
     
     print(f"DEBUG: Total candles loaded: {len(candles)}")
     print(f"DEBUG: Unique dates in candles: {candles['trade_date'].unique().tolist()}")
 
     try:
-        model, le = ml.load_model()
+        model = ml.load_model()
         use_ml = True
-        print("   Using trained ML model for strike selection.\n")
+        print("   Using Model Krishna for strike selection.")
     except FileNotFoundError:
         use_ml = False
-        print("   ⚠️  No trained model found. Using ATM (index 5) as fallback.\n")
+        print("   ⚠️  No Model Krishna found. Using ATM as fallback.")
+
+    try:
+        arjun = arjun_model.load_arjun_model()
+        use_arjun = True
+        print("   Using Model Arjun for mid-day exits.\n")
+    except FileNotFoundError:
+        use_arjun = False
+        print("   ⚠️  No Model Arjun found. Using standard ST/VWAP exit.\n")
 
     results = []
     days = sorted(feat_df["trade_date"].unique())
@@ -74,12 +104,27 @@ def run_backtest():
             X_rows = day_feat[config.ML_FEATURES].fillna(0)
             if X_rows.empty:
                 selected_strike = int(day_feat.iloc[0]["atm"])
+                confidence = 0.0
+                best_feature_dict = {}
             else:
-                proba      = model.predict_proba(X_rows)
-                best_idx   = proba.sum(axis=0).argmax()
-                best_offset = float(le.inverse_transform([best_idx])[0])
-                atm = int(day_feat.iloc[0]["atm"])
-                selected_strike = int(atm + best_offset)
+                proba = model.predict_proba(X_rows)[:, 1]
+                best_idx = proba.argmax()
+                selected_strike = int(day_feat.iloc[best_idx]["strike"])
+                confidence = float(proba[best_idx])
+                best_feature_dict = X_rows.iloc[best_idx].to_dict()
+            
+            # --- LOG TO DATABASE (un-empty the table) ---
+            best_pnl_idx = day_feat["pnl"].idxmax()
+            best_strike_actual = int(day_feat.loc[best_pnl_idx, "strike"])
+            
+            ml.log_prediction_to_db(
+                trade_date=trade_date,
+                predicted_strike=selected_strike,
+                confidence=confidence,
+                features_dict=best_feature_dict,
+                actual_best_strike=best_strike_actual,
+                prediction_correct=(selected_strike == best_strike_actual)
+            )
         else:
             selected_strike = int(day_feat.iloc[0]["atm"])
 
@@ -89,7 +134,17 @@ def run_backtest():
 
         # Rename ts → datetime for simulate_pnl compatibility
         strike_candles = strike_candles.rename(columns={"ts": "datetime"})
-        pnl = ml.simulate_pnl(strike_candles)
+        
+        if use_arjun:
+            pnl, reason, t_exit = arjun_model.simulate_pnl_with_arjun(
+                strike_candles, 
+                arjun_model=arjun, 
+                threshold=config.ARJUN_EXIT_THRESHOLD
+            )
+        else:
+            # Fallback to standard ML/VWAP simulator
+            pnl = ml.simulate_pnl(strike_candles, sl_multiplier=sl_multiplier)
+            reason = "STATIC_SL_OR_VWAP"
 
         best_pnl    = day_feat["pnl"].max()
         best_strike = int(day_feat.loc[day_feat["pnl"].idxmax(), "strike"])
@@ -101,6 +156,7 @@ def run_backtest():
             "pnl":             pnl,
             "best_pnl":        best_pnl,
             "picked_best":     selected_strike == best_strike,
+            "exit_reason":     reason
         })
 
     if not results:
@@ -156,36 +212,38 @@ def main():
                         help="Backfill start date YYYY-MM-DD")
     parser.add_argument("--end",   default=config.BACKTEST_END,
                         help="Backfill end date YYYY-MM-DD")
+    parser.add_argument("--sl_multiplier", type=float, default=config.SL_MULTIPLIER,
+                        help="Stop Loss multiplier (default from config)")
     args = parser.parse_args()
 
     # ── Startup: init schema + auto-login ──
     os.makedirs(config.LOGS_PATH,   exist_ok=True)
     os.makedirs(config.MODELS_PATH, exist_ok=True)
 
-    print("🗄️  Initializing PostgreSQL schema …")
+    print("Initializing PostgreSQL schema ...")
     db.init_schema()
 
-    print("🔐 Ensuring Kite access token …")
+    print("Ensuring Kite access token ...")
     kite = kite_auth.get_kite()
 
     # ── Route to mode ──
     if args.mode == "backfill":
         dc.backfill_history(kite, start_date=args.start, end_date=args.end)
-        print("\n✅ Backfill complete. Run --mode train next.\n")
+        print("\nBackfill complete. Run --mode train next.\n")
 
     elif args.mode == "train":
-        print("\n🤖 Training ML model …\n")
+        print("\nTraining ML model ...\n")
         feat_df = ml.build_features_from_db()
         ml.train_model(feat_df)
-        print("\n✅ Model trained. Run --mode backtest to validate.\n")
+        print("\nModel trained. Run --mode backtest to validate.\n")
 
     elif args.mode == "backtest":
-        run_backtest()
+        run_backtest(args.start, args.end, sl_multiplier=args.sl_multiplier)
 
     elif args.mode == "live":
         paper = not args.real
         if not paper:
-            confirm = input("⚠️  REAL ORDER MODE. Type 'YES' to confirm: ")
+            confirm = input("!!! REAL ORDER MODE. Type 'YES' to confirm: ")
             if confirm != "YES":
                 print("Aborted.")
                 return

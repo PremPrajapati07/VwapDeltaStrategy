@@ -20,7 +20,8 @@ from collections import defaultdict
 
 import config
 import data_collector as dc
-import ml_model as ml
+import krishna_model as ml
+import arjun_model
 import db
 
 os.makedirs(config.LOGS_PATH, exist_ok=True)
@@ -211,6 +212,14 @@ def run_live_trading(kite, lots: int = 1, paper_trade: bool = True):
     re_entry_count       = 0
     selected_strike_info = None
     cooldown_until       = None
+    
+    # Load Model Arjun for real-time exit monitoring
+    try:
+        arjun = arjun_model.load_arjun_model()
+        log.info("Model Arjun loaded for live monitoring.")
+    except Exception as e:
+        arjun = None
+        log.warning(f"Failed to load Model Arjun ({e}). Only static SL/VWAP will be used.")
 
     print(f"\n{'='*60}")
     print(f"  NIFTY STRADDLE VWAP STRATEGY — {today}  (Expiry: {expiry})")
@@ -365,6 +374,52 @@ def run_live_trading(kite, lots: int = 1, paper_trade: bool = True):
                     )
                 re_entry_count += 1
                 continue
+            
+            # --- MODEL ARJUN DYNAMIC EXIT ---
+            if arjun is not None:
+                pnl_pts     = position.entry_premium - straddle
+                max_pnl     = max(getattr(position, 'max_pnl_pts', 0), pnl_pts)
+                position.max_pnl_pts = max_pnl
+                drawdown    = max_pnl - pnl_pts
+                
+                # Dynamic Greek/IV features
+                curr_iv    = float(cur_row.get("ce_iv", 0)) + float(cur_row.get("pe_iv", 0))
+                entry_iv   = getattr(position, 'entry_iv', curr_iv) 
+                if not hasattr(position, 'entry_iv'): position.entry_iv = curr_iv
+                
+                iv_d       = curr_iv - entry_iv
+                delta_d    = abs(float(cur_row.get("ce_delta", 0)) + float(cur_row.get("pe_delta", 0)))
+                theta_v    = float(cur_row.get("ce_theta", 0)) + float(cur_row.get("pe_theta", 0))
+                
+                # rel_vol calculation (in-memory rolling avg)
+                if not hasattr(position, 'vol_window'): position.vol_window = []
+                position.vol_window.append(vol)
+                if len(position.vol_window) > 15: position.vol_window.pop(0)
+                avg_vol = max(sum(position.vol_window) / len(position.vol_window), 1.0)
+                rel_vol = min(vol / avg_vol, 100.0)
+
+                # Predict exit
+                result = arjun_model.predict_exit(
+                    pnl_pts=pnl_pts, max_pnl_so_far=max_pnl, drawdown=drawdown,
+                    vwap_gap_pct=gap_pct, delta_drift=delta_d,
+                    theta_velocity=theta_v, iv_drift=iv_d, rel_vol_15m=rel_vol,
+                    model=arjun, threshold=config.ARJUN_EXIT_THRESHOLD
+                )
+                
+                if result["should_exit"]:
+                    reason = f"ARJUN_EXIT ({result['confidence']:.0%})"
+                    pnl = _exit_position(kite, position, straddle, reason, paper_trade, now)
+                    total_pnl += pnl
+                    log_trade_to_db(position, now, straddle, reason, pnl, expiry, paper_trade)
+                    position = None
+                    
+                    if config.REENTRY_ALLOWED and config.REENTRY_REEVALUATE_STRIKE:
+                        selected_strike_info = _reevaluate_strike(
+                            kite, strikes, vwap_tracker, vix,
+                            nifty_prev_change, nifty_open_gap, today, expiry
+                        )
+                    re_entry_count += 1
+                    continue
 
             if straddle > vwap:
                 pnl = _exit_position(kite, position, straddle, "VWAP_CROSS", paper_trade, now)
