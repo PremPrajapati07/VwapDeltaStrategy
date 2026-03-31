@@ -93,6 +93,7 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
         print("   ⚠️  No Model Arjun found. Using standard ST/VWAP exit.\n")
 
     results = []
+    all_detailed_trades = []
     days = sorted(feat_df["trade_date"].unique())
 
     for trade_date in days:
@@ -135,17 +136,32 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
         # Rename ts → datetime for simulate_pnl compatibility
         strike_candles = strike_candles.rename(columns={"ts": "datetime"})
         
+        day_trades = []
         if use_arjun:
-            pnl, reason, t_exit = arjun_model.simulate_pnl_with_arjun(
+            # arjun_model.simulate_pnl_with_arjun now returns list[dict]
+            day_trades = arjun_model.simulate_pnl_with_arjun(
                 strike_candles, 
                 arjun_model=arjun, 
                 threshold=config.ARJUN_EXIT_THRESHOLD
             )
         else:
-            # Fallback to standard ML/VWAP simulator
+            # Fallback (old limited simulator)
             pnl = ml.simulate_pnl(strike_candles, sl_multiplier=sl_multiplier)
-            reason = "STATIC_SL_OR_VWAP"
+            day_trades = [{
+                "entry_time": strike_candles.iloc[0]["datetime"],
+                "entry_price": 0, # prices not tracked in old sim
+                "exit_time": strike_candles.iloc[-1]["datetime"],
+                "exit_price": 0,
+                "pnl_pts": pnl,
+                "exit_reason": "STATIC_SL_OR_VWAP"
+            }]
 
+        for tr in day_trades:
+            tr["trade_date"] = trade_date
+            tr["selected_strike"] = selected_strike
+            all_detailed_trades.append(tr)
+
+        day_total_pnl = sum(t["pnl_pts"] for t in day_trades)
         best_pnl    = day_feat["pnl"].max()
         best_strike = int(day_feat.loc[day_feat["pnl"].idxmax(), "strike"])
 
@@ -153,10 +169,10 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
             "trade_date":      trade_date,
             "selected_strike": selected_strike,
             "best_strike":     best_strike,
-            "pnl":             pnl,
+            "pnl":             day_total_pnl,
             "best_pnl":        best_pnl,
             "picked_best":     selected_strike == best_strike,
-            "exit_reason":     reason
+            "trades_count":    len(day_trades)
         })
 
     if not results:
@@ -193,9 +209,18 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
     print("=" * 60)
 
     report_path = os.path.join(config.LOGS_PATH, "backtest_report.csv")
-    os.makedirs(config.LOGS_PATH, exist_ok=True)
     res_df.to_csv(report_path, index=False)
-    print(f"\n  Full report saved → {report_path}\n")
+    
+    detailed_path = os.path.join(config.LOGS_PATH, "backtest_trades_detailed.csv")
+    detailed_df = pd.DataFrame(all_detailed_trades)
+    if not detailed_df.empty:
+        # Reorder columns for clarity
+        cols = ["trade_date", "selected_strike", "entry_time", "entry_price", "exit_time", "exit_price", "pnl_pts", "exit_reason"]
+        detailed_df = detailed_df[[c for c in cols if c in detailed_df.columns]]
+        detailed_df.to_csv(detailed_path, index=False)
+        print(f"  Detailed trade log saved → {detailed_path}")
+
+    print(f"\n  Daily summary saved → {report_path}\n")
 
 
 # ── CLI ──────────────────────────────────────────────────────
