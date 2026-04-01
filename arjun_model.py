@@ -216,40 +216,31 @@ def simulate_pnl_with_arjun(
     arjun_model=None,
     sl_multiplier: float = None,  
     hard_exit_time: str = None,
-    threshold: float = 0.55,
+    threshold: float = None,
 ) -> list:
     """
-    Simulate trades for one strike's candle data using Arjun for exits.
-    Returns a list of dicts: [
-      { 'entry_time': ..., 'entry_price': ..., 'exit_time': ..., 'exit_price': ..., 
-        'pnl_pts': ..., 'exit_reason': ... }, ...
-    ]
-
-    Matches live_trader.py re-entry logic:
-    - Enter when price < VWAP.
-    - Exit when Arjun signals OR price > VWAP OR Hard Exit.
-    - Re-enter if price < VWAP again (after exit).
+    Standard simulation entry point for main.py.
+    Now delegates to v2 for consistency using config.py settings.
     """
     import config as cfg
-    hard_exit = dt.time(*[int(x) for x in (hard_exit_time or cfg.HARD_EXIT_TIME).split(":")])
+    if arjun_model is None:
+        arjun_model = load_arjun_model()
+    
+    return simulate_pnl_with_arjun_v2(
+        grp, 
+        arjun_model, 
+        threshold=threshold or cfg.ARJUN_EXIT_THRESHOLD,
+        p_target=cfg.DAILY_PROFIT_TARGET,
+        s_loss=cfg.DAILY_STOP_LOSS
+    )
 
-    # Convert timestamps to IST
-    ts_col = "ts" if "ts" in grp.columns else "datetime"
-    grp = grp.sort_values(ts_col).reset_index(drop=True)
-    grp["_ts"] = pd.to_datetime(grp[ts_col])
-    if grp["_ts"].dt.tz is not None:
-        grp["_ts_ist"] = grp["_ts"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
-    else:
-        grp["_ts_ist"] = grp["_ts"]
-    grp["_t"] = grp["_ts_ist"].dt.time
-
-    # Ensure numeric columns
-    numeric_cols = ["straddle_price", "vwap", "vwap_gap_pct", "ce_delta", "pe_delta", 
-                    "ce_theta", "pe_theta", "ce_iv", "pe_iv", "straddle_volume"]
-    for col in numeric_cols:
-        if col in grp.columns:
-            grp[col] = pd.to_numeric(grp[col], errors="coerce").fillna(0)
-
+def simulate_pnl_with_arjun_v2(grp, arjun_model, threshold=0.65, p_target=100.0, s_loss=-50.0):
+    """
+    Fast version of the simulator for parallel optimization.
+    Uses passed arguments instead of global config.
+    """
+    import config as cfg
+    hard_exit     = dt.time(15, 0)
     trades        = []
     position      = False
     entry_time    = None
@@ -258,34 +249,40 @@ def simulate_pnl_with_arjun(
     max_pnl       = 0.0
     vol_window    = []
     cooldown_until = None
+    
+    cumulative_pnl = 0.0
+    trade_count    = 0
 
     for i, row in grp.iterrows():
-        t      = row["_t"]
-        ts_full = row["_ts_ist"]
+        t      = row["_t"] if "_t" in row else row["datetime"].time()
+        ts_full = row["_ts_ist"] if "_ts_ist" in row else row["datetime"]
         price  = float(row["straddle_price"])
         vwap   = float(row["vwap"]) if float(row["vwap"]) > 0 else price
         
-        # Cooldown management
+        # --- Guardrail Check: Daily Limits ---
+        if not position:
+            if trade_count >= cfg.MAX_TRADES_PER_DAY: break
+            if cumulative_pnl <= s_loss: break
+            if trade_count >= cfg.MAX_TRADES_FOR_PROFIT_TARGET and cumulative_pnl >= p_target:
+                break
+        
         if cooldown_until and ts_full < cooldown_until:
             continue
 
-        # 1. Hard Exit (End of Day)
         if t >= hard_exit:
             if position:
                 pnl_pts = entry_price - price
                 trades.append({
-                    "entry_time": entry_time,
-                    "entry_price": entry_price,
-                    "exit_time": ts_full,
-                    "exit_price": price,
-                    "pnl_pts": pnl_pts,
-                    "exit_reason": "HARD_EXIT"
+                    "entry_time": entry_time, "entry_price": entry_price,
+                    "exit_time": ts_full, "exit_price": price,
+                    "pnl_pts": pnl_pts, "exit_reason": "HARD_EXIT"
                 })
+                cumulative_pnl += pnl_pts
+                trade_count += 1
                 position = False
             break
 
         if not position:
-            # 2. Entry Logic: price < VWAP
             if price < vwap:
                 entry_time  = ts_full
                 entry_price = price
@@ -294,25 +291,21 @@ def simulate_pnl_with_arjun(
                 vol_window  = []
                 position    = True
         else:
-            # 3. Monitoring Logic
             pnl_pts     = entry_price - price
             max_pnl     = max(max_pnl, pnl_pts)
             drawdown    = max_pnl - pnl_pts
-
-            # Rolling volume
-            vol         = float(row.get("straddle_volume", 0))
+            vol         = float(row.get("ce_volume", 0)) + float(row.get("pe_volume", 0))
             vol_window.append(vol)
             if len(vol_window) > 15: vol_window.pop(0)
-            avg_vol     = max(sum(vol_window) / len(vol_window), 1.0)
+            avg_vol     = max(sum(vol_window)/len(vol_window), 1.0)
             rel_vol     = min(vol / avg_vol, 100.0)
 
             curr_iv     = float(row.get("ce_iv", 0)) + float(row.get("pe_iv", 0))
             delta_d     = abs(float(row.get("ce_delta", 0)) + float(row.get("pe_delta", 0)))
             theta_v     = float(row.get("ce_theta", 0)) + float(row.get("pe_theta", 0))
-            vwap_gap    = float(row.get("vwap_gap_pct", 0))
+            vwap_gap    = (vwap - price) / vwap * 100 if vwap else 0
             iv_d        = curr_iv - entry_iv
 
-            # Ask Arjun
             decision = predict_exit(
                 pnl_pts=pnl_pts, max_pnl_so_far=max_pnl, drawdown=drawdown,
                 vwap_gap_pct=vwap_gap, delta_drift=delta_d,
@@ -328,17 +321,14 @@ def simulate_pnl_with_arjun(
 
             if exit_reason:
                 trades.append({
-                    "entry_time": entry_time,
-                    "entry_price": entry_price,
-                    "exit_time": ts_full,
-                    "exit_price": price,
-                    "pnl_pts": pnl_pts,
-                    "exit_reason": exit_reason
+                    "entry_time": entry_time, "entry_price": entry_price,
+                    "exit_time": ts_full, "exit_price": price,
+                    "pnl_pts": pnl_pts, "exit_reason": exit_reason
                 })
+                cumulative_pnl += pnl_pts
+                trade_count += 1
                 position = False
-                # 15-min cooldown after exit (matching live_trader.py config)
-                from config import SL_COOLDOWN_MINUTES
-                cooldown_until = ts_full + pd.Timedelta(minutes=SL_COOLDOWN_MINUTES)
+                cooldown_until = ts_full + pd.Timedelta(minutes=cfg.SL_COOLDOWN_MINUTES)
 
     return trades
 

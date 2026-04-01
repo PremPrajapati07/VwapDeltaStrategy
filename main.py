@@ -8,22 +8,33 @@ Usage:
   python main.py --mode backtest     # Simulate strategy on historical data
   python main.py --mode live         # Run live (paper trade by default)
   python main.py --mode live --real  # Run with real orders (caution!)
-
-First-time setup:
-  1. Copy .env.example to .env and fill in all values
-  2. Ensure PostgreSQL is running and DATABASE_URL is set
-  3. Run: python main.py --mode backfill
-  4. Then: train → backtest → live
-
-Login is fully automated — no manual token needed!
 """
 
 import argparse
 import datetime as dt
 import os
+import time
 import pandas as pd
+from zoneinfo import ZoneInfo
 
 import config
+import logging
+
+# ── Centralized Logging ──────────────────────────────────────
+# Initialize immediately before any other local imports to ensure consistency
+if not os.path.exists(config.LOGS_PATH):
+    os.makedirs(config.LOGS_PATH)
+
+_log_file = os.path.join(config.LOGS_PATH, "trading_engine.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(_log_file, encoding='utf-8')
+    ]
+)
+print(f"📝 Logging initialized. File: {_log_file}")
+
 import db
 import kite_auth
 import data_collector as dc
@@ -31,17 +42,14 @@ import krishna_model as ml
 import arjun_model
 import live_trader as lt
 
+IST = ZoneInfo("Asia/Kolkata")
+
 
 # ── Backtest ─────────────────────────────────────────────────
 
 def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPLIER):
-    """
-    Full backtest: for each historical Thursday, simulate the strategy
-    using VWAP crossover on the strike the ML model would have chosen.
-    Prints a detailed P&L report.
-    """
     print(f"\n📈 Running Backtest from {start_date or 'ALL'} to {end_date or 'ALL'} …\n")
-    
+
     with db.get_conn() as conn:
         q_feat = "SELECT * FROM daily_features"
         q_cand = "SELECT * FROM straddle_candles"
@@ -52,18 +60,17 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
             where_clause = " WHERE " + " AND ".join(conds)
             q_feat += where_clause
             q_cand += where_clause
-        
+
         feat_df = pd.read_sql(q_feat, conn)
         candles = pd.read_sql(q_cand + " ORDER BY trade_date, strike, ts", conn)
 
     if feat_df.empty:
-        print("❌ No feature data found for these dates. Run --mode train first.")
+        print("❌ No feature data found. Run --mode train first.")
         return
 
-    # Ensure numeric types for ALL price and calc columns (Postgres may return Decimals as objects)
     numeric_cols = [
-        "ce_iv", "pe_iv", "ce_delta", "pe_delta", 
-        "ce_theta", "pe_theta", "ce_gamma", "pe_gamma", 
+        "ce_iv", "pe_iv", "ce_delta", "pe_delta",
+        "ce_theta", "pe_theta", "ce_gamma", "pe_gamma",
         "ce_vega", "pe_vega", "synthetic_spot", "vwap", "vwap_gap_pct",
         "straddle_price", "ce_close", "pe_close", "ce_oi", "pe_oi", "atm"
     ]
@@ -72,12 +79,12 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
             candles[col] = pd.to_numeric(candles[col], errors="coerce").fillna(0)
 
     candles["ts"] = pd.to_datetime(candles["ts"])
-    
+
     print(f"DEBUG: Total candles loaded: {len(candles)}")
     print(f"DEBUG: Unique dates in candles: {candles['trade_date'].unique().tolist()}")
 
     try:
-        model = ml.load_model()
+        model  = ml.load_model()
         use_ml = True
         print("   Using Model Krishna for strike selection.")
     except FileNotFoundError:
@@ -85,39 +92,38 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
         print("   ⚠️  No Model Krishna found. Using ATM as fallback.")
 
     try:
-        arjun = arjun_model.load_arjun_model()
+        arjun     = arjun_model.load_arjun_model()
         use_arjun = True
         print("   Using Model Arjun for mid-day exits.\n")
     except FileNotFoundError:
         use_arjun = False
-        print("   ⚠️  No Model Arjun found. Using standard ST/VWAP exit.\n")
+        print("   ⚠️  No Model Arjun found. Using standard SL/VWAP exit.\n")
 
-    results = []
+    results            = []
     all_detailed_trades = []
-    days = sorted(feat_df["trade_date"].unique())
+    days               = sorted(feat_df["trade_date"].unique())
 
     for trade_date in days:
-        date_str = pd.to_datetime(trade_date).strftime('%Y-%m-%d')
-        day_feat = feat_df[pd.to_datetime(feat_df["trade_date"]).dt.strftime('%Y-%m-%d') == date_str]
+        date_str    = pd.to_datetime(trade_date).strftime('%Y-%m-%d')
+        day_feat    = feat_df[pd.to_datetime(feat_df["trade_date"]).dt.strftime('%Y-%m-%d') == date_str]
         day_candles = candles[pd.to_datetime(candles["trade_date"]).dt.strftime('%Y-%m-%d') == date_str]
 
         if use_ml:
             X_rows = day_feat[config.ML_FEATURES].fillna(0)
             if X_rows.empty:
-                selected_strike = int(day_feat.iloc[0]["atm"])
-                confidence = 0.0
+                selected_strike   = int(day_feat.iloc[0]["atm"])
+                confidence        = 0.0
                 best_feature_dict = {}
             else:
-                proba = model.predict_proba(X_rows)[:, 1]
-                best_idx = proba.argmax()
+                proba           = model.predict_proba(X_rows)[:, 1]
+                best_idx        = proba.argmax()
                 selected_strike = int(day_feat.iloc[best_idx]["strike"])
-                confidence = float(proba[best_idx])
+                confidence      = float(proba[best_idx])
                 best_feature_dict = X_rows.iloc[best_idx].to_dict()
-            
-            # --- LOG TO DATABASE (un-empty the table) ---
-            best_pnl_idx = day_feat["pnl"].idxmax()
+
+            best_pnl_idx       = day_feat["pnl"].idxmax()
             best_strike_actual = int(day_feat.loc[best_pnl_idx, "strike"])
-            
+
             ml.log_prediction_to_db(
                 trade_date=trade_date,
                 predicted_strike=selected_strike,
@@ -126,6 +132,19 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
                 actual_best_strike=best_strike_actual,
                 prediction_correct=(selected_strike == best_strike_actual)
             )
+
+            if confidence < config.KRISHNA_MIN_CONFIDENCE:
+                results.append({
+                    "trade_date":      trade_date,
+                    "selected_strike": selected_strike,
+                    "best_strike":     best_strike_actual,
+                    "pnl":             0.0,
+                    "best_pnl":        day_feat["pnl"].max(),
+                    "picked_best":     False,
+                    "trades_count":    0,
+                    "skip_reason":     f"LOW_CONF({confidence:.0%})"
+                })
+                continue
         else:
             selected_strike = int(day_feat.iloc[0]["atm"])
 
@@ -133,37 +152,34 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
         if strike_candles.empty:
             continue
 
-        # Rename ts → datetime for simulate_pnl compatibility
         strike_candles = strike_candles.rename(columns={"ts": "datetime"})
-        
+
         day_trades = []
         if use_arjun:
-            # arjun_model.simulate_pnl_with_arjun now returns list[dict]
             day_trades = arjun_model.simulate_pnl_with_arjun(
-                strike_candles, 
-                arjun_model=arjun, 
+                strike_candles,
+                arjun_model=arjun,
                 threshold=config.ARJUN_EXIT_THRESHOLD
             )
         else:
-            # Fallback (old limited simulator)
-            pnl = ml.simulate_pnl(strike_candles, sl_multiplier=sl_multiplier)
+            pnl        = ml.simulate_pnl(strike_candles, sl_multiplier=sl_multiplier)
             day_trades = [{
-                "entry_time": strike_candles.iloc[0]["datetime"],
-                "entry_price": 0, # prices not tracked in old sim
-                "exit_time": strike_candles.iloc[-1]["datetime"],
-                "exit_price": 0,
-                "pnl_pts": pnl,
+                "entry_time":  strike_candles.iloc[0]["datetime"],
+                "entry_price": 0,
+                "exit_time":   strike_candles.iloc[-1]["datetime"],
+                "exit_price":  0,
+                "pnl_pts":     pnl,
                 "exit_reason": "STATIC_SL_OR_VWAP"
             }]
 
         for tr in day_trades:
-            tr["trade_date"] = trade_date
+            tr["trade_date"]      = trade_date
             tr["selected_strike"] = selected_strike
             all_detailed_trades.append(tr)
 
         day_total_pnl = sum(t["pnl_pts"] for t in day_trades)
-        best_pnl    = day_feat["pnl"].max()
-        best_strike = int(day_feat.loc[day_feat["pnl"].idxmax(), "strike"])
+        best_pnl      = day_feat["pnl"].max()
+        best_strike   = int(day_feat.loc[day_feat["pnl"].idxmax(), "strike"])
 
         results.append({
             "trade_date":      trade_date,
@@ -179,8 +195,7 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
         print("No backtest results.")
         return
 
-    res_df = pd.DataFrame(results)
-
+    res_df        = pd.DataFrame(results)
     total_pnl     = res_df["pnl"].sum()
     best_possible = res_df["best_pnl"].sum()
     win_days      = (res_df["pnl"] > 0).sum()
@@ -210,12 +225,12 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
 
     report_path = os.path.join(config.LOGS_PATH, "backtest_report.csv")
     res_df.to_csv(report_path, index=False)
-    
+
     detailed_path = os.path.join(config.LOGS_PATH, "backtest_trades_detailed.csv")
-    detailed_df = pd.DataFrame(all_detailed_trades)
+    detailed_df   = pd.DataFrame(all_detailed_trades)
     if not detailed_df.empty:
-        # Reorder columns for clarity
-        cols = ["trade_date", "selected_strike", "entry_time", "entry_price", "exit_time", "exit_price", "pnl_pts", "exit_reason"]
+        cols        = ["trade_date", "selected_strike", "entry_time", "entry_price",
+                       "exit_time", "exit_price", "pnl_pts", "exit_reason"]
         detailed_df = detailed_df[[c for c in cols if c in detailed_df.columns]]
         detailed_df.to_csv(detailed_path, index=False)
         print(f"  Detailed trade log saved → {detailed_path}")
@@ -228,31 +243,42 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
 def main():
     parser = argparse.ArgumentParser(description="Nifty VWAP Straddle Strategy")
     parser.add_argument("--mode", choices=["backfill", "train", "backtest", "live"],
-                        required=True, help="Which mode to run")
-    parser.add_argument("--real",  action="store_true",
-                        help="Place real orders (default is paper trade)")
-    parser.add_argument("--lots",  type=int, default=1,
-                        help="Number of lots to trade (default: 1)")
-    parser.add_argument("--start", default=config.BACKTEST_START,
-                        help="Backfill start date YYYY-MM-DD")
-    parser.add_argument("--end",   default=config.BACKTEST_END,
-                        help="Backfill end date YYYY-MM-DD")
-    parser.add_argument("--sl_multiplier", type=float, default=config.SL_MULTIPLIER,
-                        help="Stop Loss multiplier (default from config)")
+                        required=True)
+    parser.add_argument("--real",           action="store_true")
+    parser.add_argument("--lots",           type=int,   default=1)
+    parser.add_argument("--start",          default=config.BACKTEST_START)
+    parser.add_argument("--end",            default=config.BACKTEST_END)
+    parser.add_argument("--sl_multiplier",  type=float, default=config.SL_MULTIPLIER)
+    parser.add_argument("--skip-kite",      action="store_true")
+    parser.add_argument("--skip-neo",       action="store_true")
     args = parser.parse_args()
 
-    # ── Startup: init schema + auto-login ──
     os.makedirs(config.LOGS_PATH,   exist_ok=True)
     os.makedirs(config.MODELS_PATH, exist_ok=True)
 
-    print("Initializing PostgreSQL schema ...")
+    os.makedirs(config.LOGS_PATH, exist_ok=True)
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(os.path.join(config.LOGS_PATH, "trading_engine.log"))
+        ]
+    )
+    
     db.init_schema()
 
-    print("Ensuring Kite access token ...")
-    kite = kite_auth.get_kite()
+    # ✅ FIX: init Kite when enabled (needed for market data even in Neo mode)
+    kite = None
+    if config.ENABLE_ZERODHA and not args.skip_kite:
+        if args.mode in ("backfill", "train", "live"):
+            print("Ensuring Kite access token ...")
+            kite = kite_auth.get_kite()
 
-    # ── Route to mode ──
     if args.mode == "backfill":
+        if not kite:
+            print("❌ Backfill requires Zerodha Kite. Enable it in .env (ENABLE_ZERODHA=True).")
+            return
         dc.backfill_history(kite, start_date=args.start, end_date=args.end)
         print("\nBackfill complete. Run --mode train next.\n")
 
@@ -269,27 +295,36 @@ def main():
         paper = not args.real
         if not paper:
             confirm = input("!!! REAL ORDER MODE. Type 'YES' to confirm: ")
-            if confirm != "YES":
+            if confirm.strip() != "YES":
                 print("Aborted.")
                 return
-        
-        # ── Automated Scheduler ──
+
         if config.WAIT_FOR_MARKET_OPEN:
-            now = dt.datetime.now()
-            start_time = dt.datetime.combine(now.date(), dt.time(9, 15))
-            end_time = dt.datetime.combine(now.date(), dt.time(15, 30))
-            
-            if now < start_time:
-                wait_sec = (start_time - now).total_seconds()
-                print(f"🕙 Market not open yet. Waiting {wait_sec/60:.1f} minutes until 9:15 AM …")
-                time.sleep(wait_sec)
-            elif now > end_time:
-                print(f"🛑 Market already closed for today. exiting.")
+            now_ist   = dt.datetime.now(IST)
+            today     = now_ist.date()
+            start_ist = dt.datetime.combine(today, dt.time(9, 15), tzinfo=IST)
+            end_ist   = dt.datetime.combine(today, dt.time(15, 30), tzinfo=IST)
+
+            if now_ist > end_ist:
+                print("🛑 Market already closed for today. Exiting.")
                 return
 
-        lt.run_live_trading(kite, lots=args.lots, paper_trade=paper)
+            if now_ist < start_ist:
+                wait_sec = (start_ist - now_ist).total_seconds()
+                print(f"🕙 Market opens at 9:15 AM IST. "
+                      f"Current IST: {now_ist.strftime('%H:%M:%S')}. "
+                      f"Waiting {wait_sec/60:.1f} minutes …")
+                time.sleep(wait_sec)
+            else:
+                print(f"✅ Market already open (IST: {now_ist.strftime('%H:%M:%S')}). Starting immediately …")
+
+        lt.run_live_trading(
+            lots=args.lots,
+            paper_trade=paper,
+            skip_kite=args.skip_kite,
+            skip_neo=args.skip_neo
+        )
 
 
 if __name__ == "__main__":
-    import time
     main()
