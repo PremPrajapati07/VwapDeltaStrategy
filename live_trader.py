@@ -439,6 +439,23 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
             clear_trading_state()
             print("🆕 STARTING FRESH — running ML strike selection...")
 
+    # Initialize market context variables for re-entry ML calls
+    nifty_prev_change = 0.0
+    nifty_open_gap    = 0.0
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT nifty_prev_day_change, nifty_open_gap
+                    FROM market_context WHERE trade_date = %s
+                """, (today,))
+                row = cur.fetchone()
+                if row:
+                    nifty_prev_change = float(row[0] or 0)
+                    nifty_open_gap    = float(row[1] or 0)
+    except Exception as e:
+        log.warning(f"Failed to fetch market context from DB: {e}")
+
     if should_resume and state:
         best_strike = state["strike"]
         initial_pv  = state["cum_pv"]
@@ -459,22 +476,6 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
         
         snapshot_920      = dc.get_live_snapshot(data_broker, strikes)
         vwap_map          = vwap_tracker.get_all()
-        nifty_prev_change = 0.0
-        nifty_open_gap    = 0.0
-
-        try:
-            with db.get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT nifty_prev_day_change, nifty_open_gap
-                        FROM market_context WHERE trade_date = %s
-                    """, (today,))
-                    row = cur.fetchone()
-                    if row:
-                        nifty_prev_change = float(row[0] or 0)
-                        nifty_open_gap    = float(row[1] or 0)
-        except Exception:
-            pass
 
         try:
             prediction   = ml.predict_best_strike(
