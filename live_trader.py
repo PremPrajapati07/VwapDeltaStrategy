@@ -103,14 +103,16 @@ def place_sell_straddle(brokers, position: Position):
                 quantity=position.lots * position.lot_size,
                 side="SELL",
                 strike=position.strike,
-                expiry=position.expiry
+                expiry=position.expiry,
+                lot_size=position.lot_size,
             )
             pe_id = broker.place_order(
                 symbol=position.pe_symbol,
                 quantity=position.lots * position.lot_size,
                 side="SELL",
                 strike=position.strike,
-                expiry=position.expiry
+                expiry=position.expiry,
+                lot_size=position.lot_size,
             )
             
             if ce_id and pe_id:
@@ -137,10 +139,16 @@ def _exit_position(brokers, position: Position, current_premium: float,
     else:
         for broker in brokers:
             log.info(f"[{broker.name}] Closing position for {position.strike} | reason={reason}")
-            broker.place_order(position.ce_symbol, position.lots * position.lot_size, "BUY", 
-                               strike=position.strike, expiry=position.expiry)
-            broker.place_order(position.pe_symbol, position.lots * position.lot_size, "BUY", 
-                               strike=position.strike, expiry=position.expiry)
+            broker.place_order(
+                position.ce_symbol, position.lots * position.lot_size, "BUY",
+                strike=position.strike, expiry=position.expiry,
+                lot_size=position.lot_size,
+            )
+            broker.place_order(
+                position.pe_symbol, position.lots * position.lot_size, "BUY",
+                strike=position.strike, expiry=position.expiry,
+                lot_size=position.lot_size,
+            )
             print(f"  🔁 [{broker.name}] CLOSED Strike {position.strike} | P&L: ₹{pnl:,.0f}")
     return pnl
 
@@ -310,6 +318,23 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
         print("❌ ERROR: No execution brokers available for real trade mode.")
         return
 
+    # ── Pre-warm Kotak Neo Session ────────────────────────────
+    # Validate (and if needed refresh) the Neo session NOW — during the
+    # setup/waiting phase — so zero latency is added at the moment of entry.
+    if not paper_trade and neo_inst is not None:
+        try:
+            print("🔄 Pre-warming Kotak Neo session (validating before market open)...")
+            neo_inst = kotak_auth.refresh_if_needed(neo_inst)
+            # Update the broker object's client reference to the fresh session
+            for b in active_brokers:
+                if hasattr(b, 'client'):
+                    b.client = neo_inst
+            print("✅ Kotak Neo session pre-warmed and ready.")
+            log.info("Kotak Neo session pre-warmed successfully.")
+        except Exception as e:
+            log.warning(f"Neo pre-warm warning (non-fatal): {e}")
+            print(f"⚠️  Neo pre-warm warning: {e} — will retry at order time.")
+
     expiry = dc.get_nearest_expiry(data_broker)
 
     # ✅ FIX: parse config times as IST-aware datetimes for correct comparison
@@ -377,6 +402,16 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
     print(f"   Nifty Spot: {spot:.0f} | ATM: {atm_val} | VIX: {vix:.2f}")
     print(f"   Scanning {len(strikes)} strikes: {[s['strike'] for s in strikes]}\n")
 
+    # ── LATENCY OPTIMIZATION: Pre-warm Symbol Cache ──────────
+    # For every execution broker that supports it (like Kotak Neo), 
+    # translate Zerodha symbols to native symbols NOW (9:15 AM)
+    # so entry/exit orders are instantaneous later.
+    for broker in active_brokers:
+        if isinstance(broker, NeoBroker):
+            print(f"🔄 [{broker.name}] Pre-warming symbol cache for 11 strikes...")
+            broker.pre_map_symbols(strikes, expiry)
+            print(f"✅ [{broker.name}] Cache ready.")
+
     snapshot = dc.get_live_snapshot(data_broker, strikes)
     for _, row in snapshot.iterrows():
         vol = row["ce_volume"] + row["pe_volume"]
@@ -414,7 +449,9 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
         log.info(f"Resuming Strike {best_strike} | PV Sum: {initial_pv:.2f} | Vol: {initial_vol}")
     else:
         # SELECT NEW STRIKE — Wait until scan_time (e.g., 9:20 AM)
-        if now_ist.time() < scan_time_t:
+        if config.DEBUG_FORCE_TEST_ORDER:
+            print("⚠️  DEBUG_FORCE_TEST_ORDER=True — skipping scan_time (9:20) wait.")
+        elif now_ist.time() < scan_time_t:
             print(f"🤖 Waiting for {config.SCAN_TIME} AM IST … (current IST: {now_ist.strftime('%H:%M:%S')})")
             _wait_until_ist(scan_time_t)
 
@@ -471,7 +508,7 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
         now_t = now.time()
 
         # ── Hard exit at 15:00 IST ────────────────────────────
-        if now_t >= dt.time(15, 15):
+        if not config.DEBUG_FORCE_TEST_ORDER and now_t >= dt.time(15, 15):
             print("🏁 15:15 IST | Market closing. Finalizing for the day.")
             break
 
@@ -488,7 +525,7 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
                 break
 
         # ── Force exit open position at hard_exit_time ───────
-        if position is not None and position.is_open and now_t >= hard_exit_time:
+        if position is not None and position.is_open and not config.DEBUG_FORCE_TEST_ORDER and now_t >= hard_exit_time:
             snap = dc.get_live_snapshot(data_broker, [selected_strike_info])
             cur_price = snap.iloc[0]["straddle_price"]
             pnl = _exit_position(active_brokers, position, cur_price, "TIME_EXIT", paper_trade, now)
@@ -536,7 +573,10 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
 
         # ── Entry logic ───────────────────────────────────────
         if position is None or not position.is_open:
-            if straddle < vwap and not in_cooldown:
+            # FORCE entry if debug mode is active
+            if (straddle < vwap or config.DEBUG_FORCE_TEST_ORDER) and not in_cooldown:
+                if config.DEBUG_FORCE_TEST_ORDER:
+                    print("⚠️  DEBUG_FORCE_TEST_ORDER=True — FORCING IMMEDIATE ENTRY.")
                 if paper_trade or check_margins(active_brokers, lots):
                     position = Position(
                         strike=selected_strike_info["strike"],
@@ -651,18 +691,8 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
 
 
 # ── Helpers ──────────────────────────────────────────────────
-
-def _exit_position(brokers, position: Position, current_premium: float,
-                   reason: str, paper_trade: bool, now: dt.datetime) -> float:
-    pnl = position.pnl_points(current_premium)
-    position.is_open = False
-    if paper_trade:
-        print(f"  📝 [PAPER] BUY straddle {position.strike} @ {current_premium:.1f} | "
-              f"Reason: {reason} | P&L: ₹{pnl:,.0f}")
-    else:
-        place_buy_straddle(brokers, position, reason, current_premium)
-    return pnl
-
+# NOTE: _exit_position is defined above (line ~130) alongside place_sell_straddle.
+# It is intentionally NOT redefined here to avoid overriding the correct definition.
 
 def _reevaluate_strike(data_broker, strikes, vwap_tracker, vix,
                        prev_change, open_gap, today, expiry):

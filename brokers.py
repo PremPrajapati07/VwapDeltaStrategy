@@ -3,6 +3,7 @@
 # ============================================================
 import logging
 import time
+import traceback
 from abc import ABC, abstractmethod
 import config
 
@@ -13,7 +14,7 @@ class BaseBroker(ABC):
     
     @abstractmethod
     def place_order(self, symbol, quantity, side, product="MIS", order_type="MARKET",
-                    strike=None, expiry=None):
+                    strike=None, expiry=None, lot_size=None):
         """Place an order and return the order ID."""
         pass
 
@@ -41,7 +42,7 @@ class KiteBroker(BaseBroker):
         self.name = "Zerodha Kite"
 
     def place_order(self, symbol, quantity, side, product="MIS", order_type="MARKET",
-                    strike=None, expiry=None):
+                    strike=None, expiry=None, lot_size=None):
         try:
             # side: 'BUY' or 'SELL'
             transaction_type = self.kite.TRANSACTION_TYPE_BUY if side == "BUY" else self.kite.TRANSACTION_TYPE_SELL
@@ -94,46 +95,40 @@ class NeoBroker(BaseBroker):
     def __init__(self, neo_client):
         self.client = neo_client
         self.name = "Kotak Neo"
+        self._symbol_cache = {}  # Cache: {zerodha_symbol: kotak_symbol}
 
     def place_order(self, symbol, quantity, side, product="MIS", order_type="MARKET",
-                    strike=None, expiry=None):
+                    strike=None, expiry=None, lot_size=None):
         import kotak_auth
         import data_collector as dc
 
-        # ── Robust Just-in-Time (JIT) Symbol Translation ──────
-        try:
-            # Most reliable method: search for "NIFTY <STRIKE>"
-            # e.g., "NIFTY 22800" will return CE/PE for various expiries.
-            search_query = f"NIFTY {int(float(strike or 0))}"
-            log.info(f"[{self.name}] JIT Search Query: '{search_query}'")
-            
-            scrip_box = self.client.search_scrip(exchange_segment='nfo', symbol=search_query)
-            scrip_data = scrip_box.get("data", []) if isinstance(scrip_box, dict) else scrip_box
-            
-            if scrip_data and isinstance(scrip_data, list):
-                # Filter results to find the best match for current expiry and type
-                target_type = 'CE' if str(symbol).strip().endswith('CE') else 'PE'
-                # Format expiry for matching: Kotak often uses 'DDMMMYY' (e.g. 07APR26)
-                exp_needle = expiry.strftime("%d%b%y").upper() if expiry else ""
-                
-                match = None
-                for candidate in scrip_data:
-                    c_sym = str(candidate.get("pTrdSymbol") or candidate.get("stk") or "").strip()
-                    # Check if candidate matches our Type and Expiry
-                    if target_type in c_sym and exp_needle in c_sym.upper():
-                        match = candidate
-                        break
-                
-                if match:
-                    k_symbol = match.get("pTrdSymbol") or match.get("stk")
-                    log.info(f"[{self.name}] JIT Match Found: {symbol} ➔ {k_symbol} (Token: {match.get('pToken')})")
-                    symbol = k_symbol
-                else:
-                    log.warning(f"[{self.name}] JIT: Found {len(scrip_data)} results for {search_query} but none matched expiry {exp_needle}. Proceeding with: {symbol}")
-            else:
-                log.warning(f"[{self.name}] JIT: search_scrip returned no data for {search_query}. Using original: {symbol}")
-        except Exception as e:
-            log.error(f"[{self.name}] JIT lookup failed unexpectedly: {e}")
+        # ── Kotak Neo NFO: SDK expects quantity as a STRING of total contracts ──
+        # Kotak server error 1009 = quantity is not a valid lot-wise multiple.
+        # quantity passed in = lots × lot_size (e.g. 1 lot of Nifty = 1 × 75 = 75)
+        # lot_size passed in = position.lot_size (sourced from config.LOT_SIZE = 75)
+        #
+        # IMPORTANT: Never fall back to hardcoded 25 — Nifty lot size is now 75.
+        # Always use the lot_size argument; fall back to config only if arg is zero/None.
+        effective_lot_size = int(lot_size or config.LOT_SIZE)
+        if effective_lot_size <= 0:
+            effective_lot_size = config.LOT_SIZE
+        # Derive number of lots; clamp to at least 1
+        num_lots = max(1, int(quantity) // effective_lot_size)
+        # Total contracts sent to Kotak must be an exact lot multiple, as a string
+        neo_qty = str(num_lots * effective_lot_size)
+        log.info(
+            f"[{self.name}] Qty calc: {quantity} contracts ÷ lot_size({effective_lot_size}) "
+            f"= {num_lots} lot(s) → neo_qty='{neo_qty}' (string sent to Kotak)"
+        )
+
+        # ── 1. Symbol Translation (Fast Path) ────────────────────
+        # Skip JIT search if we already have a mapping in cache.
+        if symbol in self._symbol_cache:
+            log.debug(f"[{self.name}] Symbol Cache Hit: {symbol} ➔ {self._symbol_cache[symbol]}")
+            symbol = self._symbol_cache[symbol]
+        else:
+            # Fallback to JIT search (slow) if not cached (e.g. for re-entries)
+            symbol = self._get_mapped_symbol(symbol, strike, expiry)
 
         for attempt in range(2):  # Try twice: once normally, once after session refresh
             try:
@@ -142,9 +137,17 @@ class NeoBroker(BaseBroker):
                 p_type = 'MIS' if product == "MIS" else 'NRML'
                 o_type = 'MKT' if order_type == "MARKET" else 'L'
 
+                # ── Diagnostic Logs (User Requested) ──
+                # Access token and host from SDK internal configuration
+                cur_token = self.client.configuration.edit_token or ""
+                cur_host = getattr(self.client.configuration, "host", "") or getattr(self.client.api_client.configuration, "host", "")
+                print(f"   ORDER TOKEN: {cur_token[:20]}...")
+                print(f"   ORDER BASE URL: {cur_host}")
+                log.info(f"Order Diagnostics: host={cur_host} token={cur_token[:15]}...")
+
                 payload = {
                     "exchange_segment": 'nfo', "product": p_type, "price": '0',
-                    "order_type": o_type, "quantity": str(quantity), "validity": 'DAY',
+                    "order_type": o_type, "quantity": neo_qty, "validity": 'DAY',
                     "trading_symbol": symbol, "transaction_type": t_side, "amo": 'NO'
                 }
                 log.info(f"[{self.name}] Attempt {attempt+1}: Sending payload: {payload}")
@@ -168,8 +171,8 @@ class NeoBroker(BaseBroker):
                         fresh_client = kotak_auth.get_neo_client(force_relogin=True)
                         if fresh_client:
                             self.client = fresh_client # Update the broker's client reference
-                            log.info(f"[{self.name}] Re-login successful. Retrying order...")
-                            time.sleep(2) # Give server a moment to sync session
+                            log.info(f"[{self.name}] Re-login successful. Waiting 3s for session sync...")
+                            time.sleep(3) # Support suggested 3-5 sec delay
                             continue
                         else:
                             log.error(f"[{self.name}] Re-login failed during recovery.")
@@ -263,3 +266,60 @@ class NeoBroker(BaseBroker):
         except Exception as e:
             log.error(f"[{self.name}] Failed to get balance: {e}")
             return 0.0
+
+    # ── LATENCY OPTIMIZATION: Symbol Caching Mechanism ──────────
+    
+    def _get_mapped_symbol(self, symbol, strike, expiry) -> str:
+        """Translates a Zerodha symbol to Kotak Neo using search_scrip (slow). Stores in cache."""
+        try:
+            # ── FAST-PATH: Bypass API for standard NFO symbols ───────────
+            # If the symbol already looks like a valid exchange trading symbol 
+            # (e.g. 'NIFTY2640722200CE'), we assume it matches Kotak's backend 
+            # directly and skip the slow search_scrip call.
+            s_clean = str(symbol or "").strip()
+            if s_clean.startswith("NIFTY") and " " not in s_clean and len(s_clean) >= 14:
+                log.info(f"[{self.name}] [FAST-PATH] Using standard symbol: {s_clean}")
+                self._symbol_cache[symbol] = s_clean
+                return s_clean
+
+            # ── SLOW-PATH: Fallback to JIT Search ───────────────────────
+            search_query = f"NIFTY {int(float(strike or 0))}"
+            log.info(f"[{self.name}] [LATENCY] Performing JIT Search for '{search_query}'...")
+            
+            scrip_box = self.client.search_scrip(exchange_segment='nfo', symbol=search_query)
+            scrip_data = scrip_box.get("data", []) if isinstance(scrip_box, dict) else scrip_box
+            
+            if scrip_data and isinstance(scrip_data, list):
+                target_type = 'CE' if str(symbol).strip().endswith('CE') else 'PE'
+                exp_needle = expiry.strftime("%d%b%y").upper() if expiry else ""
+                
+                for candidate in scrip_data:
+                    c_sym = str(candidate.get("pTrdSymbol") or candidate.get("stk") or "").strip()
+                    if target_type in c_sym and exp_needle in c_sym.upper():
+                        k_symbol = candidate.get("pTrdSymbol") or candidate.get("stk")
+                        log.info(f"[{self.name}] Cache Map: {symbol} ➔ {k_symbol}")
+                        self._symbol_cache[symbol] = k_symbol
+                        return k_symbol
+
+            log.warning(f"[{self.name}] No match for {symbol} JIT search. Caching original as fallback.")
+            self._symbol_cache[symbol] = symbol
+            return symbol
+        except Exception as e:
+            log.error(f"[{self.name}] Symbol mapping failed: {e}")
+            return symbol
+
+    def pre_map_symbols(self, strikes_list, expiry_date):
+        """Pre-warms the symbol cache for all candidate strikes (call at 9:15 AM)."""
+        if not strikes_list: return
+        log.info(f"[{self.name}] 🚀 Pre-warming symbol cache for {len(strikes_list)} strikes...")
+        start_time = time.time()
+        
+        for s in strikes_list:
+            strike_val = s['strike']
+            # CE
+            self._get_mapped_symbol(s['ce_symbol'], strike_val, expiry_date)
+            # PE
+            self._get_mapped_symbol(s['pe_symbol'], strike_val, expiry_date)
+            
+        elapsed = time.time() - start_time
+        log.info(f"[{self.name}] ✅ Symbol cache pre-warmed in {elapsed:.1f}s. {len(self._symbol_cache)} mappings stored.")

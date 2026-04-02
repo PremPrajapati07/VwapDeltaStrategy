@@ -79,6 +79,9 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
             candles[col] = pd.to_numeric(candles[col], errors="coerce").fillna(0)
 
     candles["ts"] = pd.to_datetime(candles["ts"])
+    if candles["ts"].dt.tz is None:
+        candles["ts"] = candles["ts"].dt.tz_localize("UTC")
+    candles["ts"] = candles["ts"].dt.tz_convert(IST)
 
     print(f"DEBUG: Total candles loaded: {len(candles)}")
     print(f"DEBUG: Unique dates in candles: {candles['trade_date'].unique().tolist()}")
@@ -299,7 +302,10 @@ def main():
                 print("Aborted.")
                 return
 
-        if config.WAIT_FOR_MARKET_OPEN:
+        if config.DEBUG_FORCE_TEST_ORDER:
+            print("⚠️  DEBUG_FORCE_TEST_ORDER=True — skipping all market-time checks!")
+            print("   → Orders will fire immediately regardless of time.")
+        elif config.WAIT_FOR_MARKET_OPEN:
             now_ist   = dt.datetime.now(IST)
             today     = now_ist.date()
             start_ist = dt.datetime.combine(today, dt.time(9, 15), tzinfo=IST)
@@ -317,6 +323,7 @@ def main():
                 time.sleep(wait_sec)
             else:
                 print(f"✅ Market already open (IST: {now_ist.strftime('%H:%M:%S')}). Starting immediately …")
+
 
         lt.run_live_trading(
             lots=args.lots,

@@ -24,7 +24,7 @@ NEO_MOBILE_NUMBER = os.environ.get("NEO_MOBILE_NUMBER", "")
 NEO_PASSWORD      = os.environ.get("NEO_PASSWORD", "")
 NEO_MPIN          = os.environ.get("NEO_MPIN", "")
 NEO_TOTP_SECRET   = os.environ.get("NEO_TOTP_SECRET", "")
-NEO_ENVIRONMENT   = os.environ.get("NEO_ENVIRONMENT", "prod")
+NEO_ENVIRONMENT   = os.environ.get("NEO_ENVIRONMENT", "PROD")
 
 # ── Database ───────────────────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:admin@localhost:5433/VwapsDelta24March")
@@ -39,8 +39,8 @@ DEFAULT_LOTS            = 1                # default number of lots to trade
 # ── Strike Selection ───────────────────────────────────────────
 STRIKE_INTERVAL         = 100              # Nifty strike gap (universal 100)
 NUM_STRIKES_EACH_SIDE   = 5                # ±5 strikes from ATM → 11 total
-SCAN_TIME               = "10:10"          # time to lock strikes & run ML
-VWAP_START_TIME         = "10:15"          # VWAP calculation start
+SCAN_TIME               = "09:20"          # time to lock strikes & run ML
+VWAP_START_TIME         = "15:00"          # VWAP calculation start
 
 # ── Entry / Exit Rules ─────────────────────────────────────────
 ENTRY_CONDITION             = "below_vwap"   # sell when straddle < VWAP
@@ -52,7 +52,7 @@ ARJUN_EXIT_THRESHOLD        = 0.55           # Optimized for 2025 (Lower = more 
 
 # ── Strategy Guardrails (Optimized for "Profit King" 8,251 pts) 
 KRISHNA_MIN_CONFIDENCE       = 0.0           # Trade every daily strike chosen by Krishna
-DAILY_STOP_LOSS              = -100.0        # Original safety net (8,251 pt config)
+DAILY_STOP_LOSS              = -6500.0        # Original safety net (8,251 pt config)
 DAILY_PROFIT_TARGET          = 9999.0        # No limit - captures huge trend moves
 MAX_TRADES_FOR_PROFIT_TARGET = 5             # Let the strategy trade all day
 MAX_TRADES_PER_DAY           = 5             # 5 max entries
@@ -65,6 +65,12 @@ SL_MULTIPLIER               = 2.0
 CHECK_MARGIN                = False          # check available cash before entry
 MIN_REQUIRED_MARGIN         = 150000         # minimum cash required to trade (approx 1 straddle)
 WAIT_FOR_MARKET_OPEN        = True           # wait until 9:15 AM in live mode
+
+# ── DEBUG: Force immediate order test (bypass time/market checks) ─────────────
+# Set to True to skip all time guards and place a test order immediately.
+# ⚠️  REVERT TO False AFTER TESTING — do not leave this enabled in production!
+DEBUG_FORCE_TEST_ORDER      = False          # ← set to False for normal live trading
+
 
 # ── File Paths (logs & models) ───────────────────────────────
 LOGS_PATH   = "logs/"

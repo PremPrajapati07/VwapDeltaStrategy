@@ -135,7 +135,7 @@ def _login_v2(mobile: str, totp_code: str):
     log.info("Using v2 login flow (totp_login - totp_validate)...")
 
     client = NeoAPI(
-        environment=config.NEO_ENVIRONMENT,
+        environment=str(config.NEO_ENVIRONMENT).upper(),
         consumer_key=config.NEO_CONSUMER_KEY,
     )
 
@@ -152,12 +152,45 @@ def _login_v2(mobile: str, totp_code: str):
     print("   🔐 Validating TOTP Session with MPIN...")
     validate_resp = client.totp_validate(mpin=config.NEO_MPIN)
     log.info(f"totp_validate FULL RESPONSE: {validate_resp}")
-    _assert_no_error(validate_resp, "totp_validate")
+    # Capture baseUrl and token from validate_resp
+    data = validate_resp.get("data", {})
+    token = data.get("token", "")
+    baseUrl = data.get("baseUrl", "").strip("/") # Cluster URL (e.g. e21.kotaksecurities.com)
+    
+    # ── Diagnostic Logs (User Requested) ──
+    print(f"   LOGIN TOKEN: {token[:20]}...")
+    print(f"   LOGIN BASE URL: {baseUrl}")
+    log.info(f"Login Diagnostics: baseUrl={baseUrl} token={token[:15]}...")
+
+    # ── Critical Fix: Monkey Patch SDK to support Cluster URLs ──
+    # The NeoAPI SDK hardcodes a check for 'prod'/'uat' in get_domain(). 
+    # If we set host to 'e21.kotaksecurities.com', it crashes with ApiValueError.
+    # By patching get_domain, we keep host='PROD' but force the URL to the cluster.
+    if baseUrl:
+        try:
+            from types import MethodType
+            
+            # The cluster URL from Kotak often needs a trailing slash for the SDK's join logic
+            final_cluster_url = baseUrl if baseUrl.endswith("/") else (baseUrl + "/")
+
+            def patched_get_domain(self_utility, session_init=False):
+                # Always return our cluster URL instead of the default generic one
+                log.info(f"Using Patched Cluster Domain: {final_cluster_url}")
+                return final_cluster_url
+
+            # Bind the new function to the specific instance
+            client.configuration.get_domain = MethodType(patched_get_domain, client.configuration)
+            log.info(f"Successfully monkey-patched NeoUtility.get_domain to {final_cluster_url}")
+            
+            # Also ensure the generic host string is valid to pass the SDK's internal 'in host_list' check
+            client.configuration.host = "PROD" 
+
+        except Exception as e:
+            log.warning(f"Could not monkey-patch SDK domain: {e}")
 
     # Finalize session for trading
-    # (v2 SDK handles tokens internally after totp_validate; explicit get_access_token is often invalid)
-    time.sleep(1)
-    log.info("✅ Kotak Neo v2 login successful.")
+    time.sleep(3) 
+    log.info("✅ Kotak Neo v2 login successful with Cluster Redirection.")
     return client
 
 

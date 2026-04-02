@@ -206,26 +206,93 @@ def fetch_straddle_minute_data(kite: KiteConnect, strike_info: dict, trade_date:
 def compute_straddle_vwap(df: pd.DataFrame) -> pd.DataFrame:
     """Calculate cumulative volume-weighted average price (VWAP) for a straddle."""
     df = df.sort_values("date").copy()
+    df["straddle_volume"] = df.get("ce_volume", 0) + df.get("pe_volume", 0)
+    df["straddle_price"] = df["ce_close"] + df["pe_close"]
+    
     df["cum_pv"] = (df["straddle_price"] * df["straddle_volume"]).cumsum()
     df["cum_vol"] = df["straddle_volume"].cumsum()
     df["vwap"] = df["cum_pv"] / df["cum_vol"].replace(0, float("nan"))
+    df["vwap"] = df["vwap"].ffill().fillna(df["straddle_price"]) # fallback for 0 vol
     df["vwap_gap_pct"] = (df["straddle_price"] - df["vwap"]) / df["vwap"] * 100
     return df
 
 
+def add_greeks_to_historical(df: pd.DataFrame, trade_date: dt.date, expiry_str: str) -> pd.DataFrame:
+    """Calculate IV and Greeks for historical backfill dataframes."""
+    if df.empty: return df
+    try:
+        from scripts.black_scholes_utils import calculate_iv, calculate_greeks
+        
+        expiry_dt = dt.datetime.strptime(expiry_str, "%Y-%m-%d").date()
+        # For historical data, DTE is constant throughout the day
+        days_to_exp = (expiry_dt - trade_date).days
+        T = max(days_to_exp, 0.5) / 365.0
+        r = 0.07 
+
+        # We assume synthetic spot = (CE_Close - PE_Close + Strike) is a good proxy for historical Greeks
+        # Or if we have actual spot data matched by TS, we could use that. 
+        # For simplicity and consistency with the live engine, we'll use CE/PE pairing.
+        
+        for idx, row in df.iterrows():
+            strike = float(row["strike"])
+            spot = row["ce_close"] - row["pe_close"] + strike # Synthetic Spot
+            
+            # CE Greeks
+            c_iv = calculate_iv(float(row["ce_close"]), spot, strike, T, r, 'CE')
+            c_g  = calculate_greeks(spot, strike, T, r, c_iv, 'CE')
+            # PE Greeks
+            p_iv = calculate_iv(float(row["pe_close"]), spot, strike, T, r, 'PE')
+            p_g  = calculate_greeks(spot, strike, T, r, p_iv, 'PE')
+
+            df.at[idx, "synthetic_spot"] = spot
+            df.at[idx, "ce_iv"]    = c_iv
+            df.at[idx, "pe_iv"]    = p_iv
+            df.at[idx, "ce_delta"] = c_g["delta"]
+            df.at[idx, "pe_delta"] = p_g["delta"]
+            df.at[idx, "ce_theta"] = c_g["theta"]
+            df.at[idx, "pe_theta"] = p_g["theta"]
+            df.at[idx, "ce_gamma"] = c_g["gamma"]
+            df.at[idx, "pe_gamma"] = p_g["gamma"]
+            df.at[idx, "ce_vega"]  = c_g["vega"]
+            df.at[idx, "pe_vega"]  = p_g["vega"]
+    except Exception as e:
+        log.error(f"Error adding historical greeks: {e}")
+    return df
+
+
 def save_candles(df: pd.DataFrame):
-    """Upsert straddle minute candles into straddle_candles table."""
+    """Upsert straddle minute candles into straddle_candles table (FULL COLUMN MAPPING)."""
     if df.empty: return
     with db.get_conn() as conn:
         with conn.cursor() as cur:
             for _, r in df.iterrows():
+                # Extract all values with defaults for potentially missing columns
+                vals = (
+                    r["trade_date"], r["expiry"], int(r["strike"]), int(r.get("atm", 0)), r["date"],
+                    r.get("ce_open"), r.get("ce_high"), r.get("ce_low"), r.get("ce_close"), int(r.get("ce_volume", 0)), int(r.get("ce_oi", 0)),
+                    r.get("pe_open"), r.get("pe_high"), r.get("pe_low"), r.get("pe_close"), int(r.get("pe_volume", 0)), int(r.get("pe_oi", 0)),
+                    r.get("straddle_price"), int(r.get("straddle_volume", 0)), r.get("vwap"), r.get("vwap_gap_pct"),
+                    r.get("synthetic_spot"), r.get("ce_iv"), r.get("pe_iv"), 
+                    r.get("ce_delta"), r.get("ce_theta"), r.get("ce_gamma"), r.get("ce_vega"),
+                    r.get("pe_delta"), r.get("pe_theta"), r.get("pe_gamma"), r.get("pe_vega")
+                )
+                
                 cur.execute("""
                     INSERT INTO straddle_candles 
-                    (trade_date, expiry, strike, atm, ts, ce_close, pe_close, straddle_price, vwap, vwap_gap_pct)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT DO NOTHING
-                """, (r["trade_date"], r["expiry"], int(r["strike"]), int(r.get("atm", 0)), 
-                      r["date"], r["ce_close"], r["pe_close"], r["straddle_price"], r["vwap"], r["vwap_gap_pct"]))
+                    (trade_date, expiry, strike, atm, ts, 
+                     ce_open, ce_high, ce_low, ce_close, ce_volume, ce_oi,
+                     pe_open, pe_high, pe_low, pe_close, pe_volume, pe_oi,
+                     straddle_price, straddle_volume, vwap, vwap_gap_pct,
+                     synthetic_spot, ce_iv, pe_iv, 
+                     ce_delta, ce_theta, ce_gamma, ce_vega,
+                     pe_delta, pe_theta, pe_gamma, pe_vega)
+                    VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s,%s)
+                    ON CONFLICT (trade_date, strike, ts) DO UPDATE SET
+                        ce_open = EXCLUDED.ce_open, ce_high = EXCLUDED.ce_high, ce_low = EXCLUDED.ce_low, ce_close = EXCLUDED.ce_close,
+                        pe_open = EXCLUDED.pe_open, pe_high = EXCLUDED.pe_high, pe_low = EXCLUDED.pe_low, pe_close = EXCLUDED.pe_close,
+                        vwap = EXCLUDED.vwap, ce_iv = EXCLUDED.ce_iv, pe_iv = EXCLUDED.pe_iv,
+                        ce_delta = EXCLUDED.ce_delta, pe_delta = EXCLUDED.pe_delta
+                """, vals)
 
 
 def backfill_history(kite: KiteConnect, start_date: str = config.BACKTEST_START, end_date: str = config.BACKTEST_END):
@@ -240,21 +307,51 @@ def backfill_history(kite: KiteConnect, start_date: str = config.BACKTEST_START,
     
     for trade_date in trading_days:
         try:
-            spot_candles = client.historical_data(256265, dt.datetime.combine(trade_date, dt.time(9, 19)), 
-                                                   dt.datetime.combine(trade_date, dt.time(9, 21)), "minute")
-            if not spot_candles: continue
+            log.info(f"--- Processing Backfill for {trade_date} ---")
+            
+            # 1. Fetch spot at 9:19 AM to determine ATM
+            spot_start = dt.datetime.combine(trade_date, dt.time(9, 18))
+            spot_end   = dt.datetime.combine(trade_date, dt.time(9, 22))
+            
+            log.info(f"   [1/4] Fetching Nifty Spot for ATM detection ({spot_start.time()} - {spot_end.time()})...")
+            spot_candles = client.historical_data(256265, spot_start, spot_end, "minute")
+            
+            if not spot_candles:
+                log.warning(f"   ⚠️ Skipping {trade_date}: No spot candles found in the 09:18-09:22 window. (Zerodha sync delay?)")
+                continue
+                
             spot = spot_candles[-1]["close"]
+            log.info(f"   [2/4] Identified Spot: {spot}")
+            
             expiry = get_nearest_expiry(kite, base_date=trade_date)
+            log.info(f"   [3/4] Identified Nearest Expiry: {expiry}")
+            
             strikes = get_nifty_expiry_strikes(kite, spot, expiry)
-            if not strikes: continue
+            if not strikes:
+                log.warning(f"   ⚠️ Skipping {trade_date}: No strikes found for spot {spot} and expiry {expiry}.")
+                continue
+                
+            atm_strike = strikes[len(strikes)//2]["strike"]
+            log.info(f"   [4/4] Processing {len(strikes)} strikes. ATM is {atm_strike}.")
             
-            save_market_context(kite, trade_date, expiry, strikes[len(strikes)//2]["strike"], spot, get_nifty_prev_close(kite, trade_date), 0.0)
-            
+            # Save market context (VIX, etc)
+            success_count = 0
             for si in strikes:
+                log.info(f"      Fetching data for {si['strike']} {expiry}...")
                 df = fetch_straddle_minute_data(kite, si, trade_date)
                 if not df.empty:
-                    save_candles(compute_straddle_vwap(df))
-        except Exception:
+                    df["atm"] = atm_strike
+                    df = compute_straddle_vwap(df)
+                    df = add_greeks_to_historical(df, trade_date, expiry_str=expiry.strftime("%Y-%m-%d"))
+                    save_candles(df)
+                    success_count += 1
+                else:
+                    log.debug(f"      Empty data for strike {si['strike']}")
+            
+            log.info(f"✅ Completed {trade_date}. Successfully imported {success_count} strikes.")
+            
+        except Exception as e:
+            log.error(f"❌ Critical error during backfill of {trade_date}: {e}")
             continue
 
 
