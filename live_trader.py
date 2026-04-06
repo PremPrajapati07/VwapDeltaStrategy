@@ -575,7 +575,8 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
         # ── Entry logic ───────────────────────────────────────
         if position is None or not position.is_open:
             # FORCE entry if debug mode is active
-            if (straddle < vwap or config.DEBUG_FORCE_TEST_ORDER) and not in_cooldown:
+            entry_threshold_price = vwap * (1.0 - getattr(config, "VWAP_ENTRY_THRESHOLD_PCT", 0.0) / 100.0)
+            if (straddle <= entry_threshold_price or config.DEBUG_FORCE_TEST_ORDER) and not in_cooldown:
                 if config.DEBUG_FORCE_TEST_ORDER:
                     print("⚠️  DEBUG_FORCE_TEST_ORDER=True — FORCING IMMEDIATE ENTRY.")
                 if paper_trade or check_margins(active_brokers, lots):

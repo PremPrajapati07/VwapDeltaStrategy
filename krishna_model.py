@@ -251,7 +251,7 @@ def simulate_pnl(grp: pd.DataFrame,
             continue
 
         if position is None:
-            if straddle < vwap:
+            if straddle <= (vwap * (1.0 - getattr(config, "VWAP_ENTRY_THRESHOLD_PCT", 0.0) / 100.0)):
                 position      = {"entry_time": t}
                 entry_premium = straddle
         else:

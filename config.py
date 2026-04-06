@@ -44,6 +44,7 @@ VWAP_START_TIME         = "15:00"          # VWAP calculation start
 
 # ── Entry / Exit Rules ─────────────────────────────────────────
 ENTRY_CONDITION             = "below_vwap"   # sell when straddle < VWAP
+VWAP_ENTRY_THRESHOLD_PCT    = 0.4            # straddle must be at least 1.5% below vwap to trigger entry
 EXIT_CONDITION              = "above_vwap"   # buy back when straddle > VWAP
 HARD_EXIT_TIME              = "15:00"        # force close all positions
 
@@ -54,8 +55,8 @@ ARJUN_EXIT_THRESHOLD        = 0.55           # Optimized for 2025 (Lower = more 
 KRISHNA_MIN_CONFIDENCE       = 0.0           # Trade every daily strike chosen by Krishna
 DAILY_STOP_LOSS              = -6500.0        # Original safety net (8,251 pt config)
 DAILY_PROFIT_TARGET          = 9999.0        # No limit - captures huge trend moves
-MAX_TRADES_FOR_PROFIT_TARGET = 5             # Let the strategy trade all day
-MAX_TRADES_PER_DAY           = 5             # 5 max entries
+MAX_TRADES_FOR_PROFIT_TARGET = 2             # Let the strategy trade all day
+MAX_TRADES_PER_DAY           = 2             # 5 max entries
 SL_COOLDOWN_MINUTES          = 15            # Cooldown after SL hit
 
 # ── Risk & Reliability ─────────────────────────────────────────

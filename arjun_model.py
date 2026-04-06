@@ -283,7 +283,7 @@ def simulate_pnl_with_arjun_v2(grp, arjun_model, threshold=0.65, p_target=100.0,
             break
 
         if not position:
-            if price < vwap:
+            if price <= (vwap * (1.0 - getattr(cfg, "VWAP_ENTRY_THRESHOLD_PCT", 0.0) / 100.0)):
                 entry_time  = ts_full
                 entry_price = price
                 entry_iv    = float(row.get("ce_iv", 0)) + float(row.get("pe_iv", 0))
