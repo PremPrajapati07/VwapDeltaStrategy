@@ -549,6 +549,30 @@ def predict_best_strike_v2(
     return {"best_strike": best, "confidence": scores[best], "all_scores": scores}
 
 
+def log_prediction_to_db(trade_date, predicted_strike, confidence, features_dict, 
+                         actual_best_strike=None, prediction_correct=None):
+    """Save daily prediction and features to PostgreSQL for later inspection."""
+    import json
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO krishna_predictions
+                    (trade_date, predicted_strike, confidence, features_json, 
+                     actual_best_strike, prediction_correct)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (trade_date) DO UPDATE SET
+                    predicted_strike  = EXCLUDED.predicted_strike,
+                    confidence        = EXCLUDED.confidence,
+                    features_json     = EXCLUDED.features_json,
+                    actual_best_strike = EXCLUDED.actual_best_strike,
+                    prediction_correct = EXCLUDED.prediction_correct
+                """, (trade_date, int(predicted_strike), float(confidence), 
+                      json.dumps(features_dict), actual_best_strike, prediction_correct))
+    except Exception as e:
+        log.error(f"Failed to log Krishna V2 prediction to DB: {e}")
+
+
 # ── CLI ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
