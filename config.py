@@ -53,8 +53,10 @@ ARJUN_EXIT_THRESHOLD        = 0.55           # Optimized for 2025 (Lower = more 
 
 # ── Strategy Guardrails (Optimized for "Profit King" 8,251 pts) 
 KRISHNA_MIN_CONFIDENCE       = 0.0           # Trade every daily strike chosen by Krishna
-DAILY_STOP_LOSS              = -9500.0        # Original safety net (8,251 pt config)
-DAILY_PROFIT_TARGET          = 9999.0        # No limit - captures huge trend moves
+PROFIT_PROTECTION_MIN_PNL    = 25000.0        # If PnL > this, apply strict confidence threshold
+PROFIT_PROTECTION_MIN_CONF   = 0.25          # Require 25% confidence to trade when protecting profit
+DAILY_STOP_LOSS              = -100.0        # Daily Stop Loss in POINTS (e.g. -100.0)
+DAILY_PROFIT_TARGET          = 9999.0        # Daily Profit Target in POINTS
 MAX_TRADES_FOR_PROFIT_TARGET = 5             # Let the strategy trade all day
 MAX_TRADES_PER_DAY           = 5             # 5 max entries
 SL_COOLDOWN_MINUTES          = 15            # Cooldown after SL hit
@@ -79,8 +81,8 @@ MODELS_PATH = "models/"
 STATE_FILE  = "logs/trading_state.json"
 
 # ── Backtest Defaults ──────────────────────────────────────────
-BACKTEST_START = "2023-01-01"
-BACKTEST_END   = "2024-12-31"
+BACKTEST_START = "2025-01-01"
+BACKTEST_END   = "2025-12-31"
 
 # ── ML Model Features (Model Krishna) ─────────────────────────
 ML_FEATURES = [

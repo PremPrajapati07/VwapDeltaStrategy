@@ -617,8 +617,11 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
                 if config.REENTRY_ALLOWED and config.REENTRY_REEVALUATE_STRIKE:
                     selected_strike_info = _reevaluate_strike(
                         data_broker, strikes, vwap_tracker, vix,
-                        nifty_prev_change, nifty_open_gap, today, expiry
+                        nifty_prev_change, nifty_open_gap, today, expiry, cumulative_pnl
                     )
+                    if selected_strike_info is None:
+                        print("🏁 Profit protection stopped further trades. Ending day.")
+                        break
                 re_entry_count += 1
                 continue
 
@@ -662,8 +665,11 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
                     if config.REENTRY_ALLOWED and config.REENTRY_REEVALUATE_STRIKE:
                         selected_strike_info = _reevaluate_strike(
                             data_broker, strikes, vwap_tracker, vix,
-                            nifty_prev_change, nifty_open_gap, today, expiry
+                            nifty_prev_change, nifty_open_gap, today, expiry, cumulative_pnl
                         )
+                        if selected_strike_info is None:
+                            print("🏁 Profit protection stopped further trades. Ending day.")
+                            break
                     re_entry_count += 1
                     continue
 
@@ -678,8 +684,11 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
                 if config.REENTRY_ALLOWED and config.REENTRY_REEVALUATE_STRIKE:
                     selected_strike_info = _reevaluate_strike(
                         data_broker, strikes, vwap_tracker, vix,
-                        nifty_prev_change, nifty_open_gap, today, expiry
+                        nifty_prev_change, nifty_open_gap, today, expiry, cumulative_pnl
                     )
+                    if selected_strike_info is None:
+                        print("🏁 Profit protection stopped further trades. Ending day.")
+                        break
                 re_entry_count += 1
 
         time.sleep(10)
@@ -697,7 +706,7 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
 # It is intentionally NOT redefined here to avoid overriding the correct definition.
 
 def _reevaluate_strike(data_broker, strikes, vwap_tracker, vix,
-                       prev_change, open_gap, today, expiry):
+                       prev_change, open_gap, today, expiry, cumulative_pnl=0.0):
     snap     = dc.get_live_snapshot(data_broker, strikes)
     vwap_map = vwap_tracker.get_all()
     try:
@@ -706,9 +715,22 @@ def _reevaluate_strike(data_broker, strikes, vwap_tracker, vix,
             nifty_prev_change=prev_change, nifty_open_gap=open_gap,
             vwap_map=vwap_map, trade_date=today, expiry_date=expiry
         )
-        best = pred["best_strike"]
-        print(f"  🔄 Re-entry strike re-evaluated → {best}")
-    except Exception:
+        conf = pred.get("confidence", 0.0) if pred else 0.0
+        
+        # ── Bankroll Profit Protection ──
+        protect_pnl = getattr(config, "PROFIT_PROTECTION_MIN_PNL", 999999)
+        protect_conf = getattr(config, "PROFIT_PROTECTION_MIN_CONF", 0.0)
+        
+        if cumulative_pnl > protect_pnl and conf < protect_conf:
+            msg = f"🛡️  PROFIT PROTECTION: PnL > ₹{protect_pnl}. Krishna conf ({conf:.1%}) < {protect_conf:.1%} required. Aborting re-entry."
+            print(f"  {msg}")
+            log.info(msg)
+            return None
+            
+        best = pred["best_strike"] if pred else strikes[len(strikes) // 2]["strike"]
+        print(f"  🔄 Re-entry strike re-evaluated → {best} (Conf: {conf:.1%})")
+    except Exception as e:
+        log.warning(f"_reevaluate_strike failed: {e}")
         best = strikes[len(strikes) // 2]["strike"]
     return next((s for s in strikes if s["strike"] == best), strikes[len(strikes) // 2])
 
