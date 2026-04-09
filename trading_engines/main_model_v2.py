@@ -17,6 +17,13 @@ import time
 import pandas as pd
 from zoneinfo import ZoneInfo
 
+
+import sys, os
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)
+os.chdir(project_root)
+
+
 import config
 import logging
 
@@ -38,9 +45,9 @@ print(f"📝 Logging initialized. File: {_log_file}")
 import db
 import kite_auth
 import data_collector as dc
-import krishna_model as ml
-import arjun_model
-import live_trader as lt
+import krishna_v2_model as ml
+import arjun_model_v3 as arjun_model
+import live_trader_v2 as lt
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -87,7 +94,7 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
     print(f"DEBUG: Unique dates in candles: {candles['trade_date'].unique().tolist()}")
 
     try:
-        model  = ml.load_model()
+        model  = ml.load_v2_model()
         use_ml = True
         print("   Using Model Krishna for strike selection.")
     except FileNotFoundError:
@@ -102,42 +109,50 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
         use_arjun = False
         print("   ⚠️  No Model Arjun found. Using standard SL/VWAP exit.\n")
 
-    results            = []
-    all_detailed_trades = []
-    days               = sorted(feat_df["trade_date"].unique())
+def _worker_backtest_day_v2(trade_date, day_feat, day_candles, use_ml, model, use_arjun, arjun, sl_multiplier):
+    """
+    Worker function for V2 Backtest (Krishna V2 + Arjun V3).
+    Includes dynamic feature injection for 34-feature compatibility.
+    """
+    if use_ml:
+        # ✅ Fix: Dynamic Features injection for V2/V3 compatibility
+        day_feat = day_feat.copy()
+        day_feat["spot_change_pct"]     = 0.0
+        day_feat["spot_momentum_5m"]    = 0.0
+        day_feat["oi_velocity_ce"]      = 0.0
+        day_feat["oi_velocity_pe"]      = 0.0
+        day_feat["oi_buildup_ratio"]    = 0.0
+        day_feat["premium_decay_rate"]  = 0.0
+        day_feat["volume_surge"]        = 1.0
+        day_feat["minutes_since_open"]  = 5.0
 
-    for trade_date in days:
-        date_str    = pd.to_datetime(trade_date).strftime('%Y-%m-%d')
-        day_feat    = feat_df[pd.to_datetime(feat_df["trade_date"]).dt.strftime('%Y-%m-%d') == date_str]
-        day_candles = candles[pd.to_datetime(candles["trade_date"]).dt.strftime('%Y-%m-%d') == date_str]
+        X_rows = day_feat[ml.V2_FEATURES].fillna(0)
+        if X_rows.empty:
+            selected_strike   = int(day_feat.iloc[0]["atm"])
+            confidence        = 0.0
+            best_feature_dict = {}
+        else:
+            proba           = model.predict_proba(X_rows)[:, 1]
+            best_idx        = proba.argmax()
+            selected_strike = int(day_feat.iloc[best_idx]["strike"])
+            confidence      = float(proba[best_idx])
+            best_feature_dict = X_rows.iloc[best_idx].to_dict()
 
-        if use_ml:
-            X_rows = day_feat[config.ML_FEATURES].fillna(0)
-            if X_rows.empty:
-                selected_strike   = int(day_feat.iloc[0]["atm"])
-                confidence        = 0.0
-                best_feature_dict = {}
-            else:
-                proba           = model.predict_proba(X_rows)[:, 1]
-                best_idx        = proba.argmax()
-                selected_strike = int(day_feat.iloc[best_idx]["strike"])
-                confidence      = float(proba[best_idx])
-                best_feature_dict = X_rows.iloc[best_idx].to_dict()
+        best_pnl_idx       = day_feat["pnl"].idxmax()
+        best_strike_actual = int(day_feat.loc[best_pnl_idx, "strike"])
 
-            best_pnl_idx       = day_feat["pnl"].idxmax()
-            best_strike_actual = int(day_feat.loc[best_pnl_idx, "strike"])
+        ml.log_prediction_to_db(
+            trade_date=trade_date,
+            predicted_strike=selected_strike,
+            confidence=confidence,
+            features_dict=best_feature_dict,
+            actual_best_strike=best_strike_actual,
+            prediction_correct=(selected_strike == best_strike_actual)
+        )
 
-            ml.log_prediction_to_db(
-                trade_date=trade_date,
-                predicted_strike=selected_strike,
-                confidence=confidence,
-                features_dict=best_feature_dict,
-                actual_best_strike=best_strike_actual,
-                prediction_correct=(selected_strike == best_strike_actual)
-            )
-
-            if confidence < config.KRISHNA_MIN_CONFIDENCE:
-                results.append({
+        if confidence < config.KRISHNA_MIN_CONFIDENCE:
+            return {
+                "summary": {
                     "trade_date":      trade_date,
                     "selected_strike": selected_strike,
                     "best_strike":     best_strike_actual,
@@ -146,45 +161,48 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
                     "picked_best":     False,
                     "trades_count":    0,
                     "skip_reason":     f"LOW_CONF({confidence:.0%})"
-                })
-                continue
-        else:
-            selected_strike = int(day_feat.iloc[0]["atm"])
+                },
+                "detailed_trades": []
+            }
+    else:
+        selected_strike = int(day_feat.iloc[0]["atm"])
 
-        strike_candles = day_candles[day_candles["strike"] == selected_strike]
-        if strike_candles.empty:
-            continue
+    strike_candles = day_candles[day_candles["strike"] == selected_strike]
+    if strike_candles.empty:
+        return None
 
-        strike_candles = strike_candles.rename(columns={"ts": "datetime"})
+    strike_candles = strike_candles.rename(columns={"ts": "datetime"})
 
-        day_trades = []
-        if use_arjun:
-            day_trades = arjun_model.simulate_pnl_with_arjun(
-                strike_candles,
-                arjun_model=arjun,
-                threshold=config.ARJUN_EXIT_THRESHOLD
-            )
-        else:
-            pnl        = ml.simulate_pnl(strike_candles, sl_multiplier=sl_multiplier)
-            day_trades = [{
-                "entry_time":  strike_candles.iloc[0]["datetime"],
-                "entry_price": 0,
-                "exit_time":   strike_candles.iloc[-1]["datetime"],
-                "exit_price":  0,
-                "pnl_pts":     pnl,
-                "exit_reason": "STATIC_SL_OR_VWAP"
-            }]
+    day_trades = []
+    if use_arjun:
+        day_trades = arjun_model.simulate_pnl_with_arjun_v3(
+            strike_candles,
+            arjun_model=arjun,
+            threshold=config.ARJUN_EXIT_THRESHOLD
+        )
+    else:
+        pnl        = ml.simulate_pnl(strike_candles, sl_multiplier=sl_multiplier)
+        day_trades = [{
+            "entry_time":  strike_candles.iloc[0]["datetime"],
+            "entry_price": 0,
+            "exit_time":   strike_candles.iloc[-1]["datetime"],
+            "exit_price":  0,
+            "pnl_pts":     pnl,
+            "exit_reason": "STATIC_SL_OR_VWAP"
+        }]
 
-        for tr in day_trades:
-            tr["trade_date"]      = trade_date
-            tr["selected_strike"] = selected_strike
-            all_detailed_trades.append(tr)
+    detailed_trades_day = []
+    for tr in day_trades:
+        tr["trade_date"]      = trade_date
+        tr["selected_strike"] = selected_strike
+        detailed_trades_day.append(tr)
 
-        day_total_pnl = sum(t["pnl_pts"] for t in day_trades)
-        best_pnl      = day_feat["pnl"].max()
-        best_strike   = int(day_feat.loc[day_feat["pnl"].idxmax(), "strike"])
+    day_total_pnl = sum(t["pnl_pts"] for t in day_trades)
+    best_pnl      = day_feat["pnl"].max()
+    best_strike   = int(day_feat.loc[day_feat["pnl"].idxmax(), "strike"])
 
-        results.append({
+    return {
+        "summary": {
             "trade_date":      trade_date,
             "selected_strike": selected_strike,
             "best_strike":     best_strike,
@@ -192,7 +210,96 @@ def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPL
             "best_pnl":        best_pnl,
             "picked_best":     selected_strike == best_strike,
             "trades_count":    len(day_trades)
-        })
+        },
+        "detailed_trades": detailed_trades_day
+    }
+
+
+def run_backtest(start_date=None, end_date=None, sl_multiplier=config.SL_MULTIPLIER):
+    print(f"\n📈 Running Parallel Backtest from {start_date or 'ALL'} to {end_date or 'ALL'} …\n")
+
+    with db.get_conn() as conn:
+        q_feat = "SELECT * FROM daily_features"
+        q_cand = "SELECT * FROM straddle_candles"
+        if start_date or end_date:
+            conds = []
+            if start_date: conds.append(f"trade_date >= '{start_date}'")
+            if end_date:   conds.append(f"trade_date <= '{end_date}'")
+            where_clause = " WHERE " + " AND ".join(conds)
+            q_feat += where_clause
+            q_cand += where_clause
+
+        feat_df = pd.read_sql(q_feat, conn)
+        candles = pd.read_sql(q_cand + " ORDER BY trade_date, strike, ts", conn)
+
+    if feat_df.empty:
+        print("❌ No feature data found. Run --mode train first.")
+        return
+
+    numeric_cols = [
+        "ce_iv", "pe_iv", "ce_delta", "pe_delta",
+        "ce_theta", "pe_theta", "ce_gamma", "pe_gamma",
+        "ce_vega", "pe_vega", "synthetic_spot", "vwap", "vwap_gap_pct",
+        "straddle_price", "ce_close", "pe_close", "ce_oi", "pe_oi", "atm", "strike"
+    ]
+    for col in numeric_cols:
+        if col in candles.columns:
+            candles[col] = pd.to_numeric(candles[col], errors="coerce").fillna(0)
+
+    candles["ts"] = pd.to_datetime(candles["ts"])
+    if candles["ts"].dt.tz is None:
+        candles["ts"] = candles["ts"].dt.tz_localize("UTC")
+    candles["ts"] = candles["ts"].dt.tz_convert(IST)
+
+    try:
+        model  = ml.load_v2_model()
+        use_ml = True
+        print("   Using Model Krishna for strike selection.")
+    except Exception:
+        model  = None
+        use_ml = False
+        print("   ⚠️  No Model Krishna found. Using ATM as fallback.")
+
+    try:
+        arjun     = arjun_model.load_arjun_model()
+        use_arjun = True
+        print("   Using Model Arjun for mid-day exits.\n")
+    except Exception:
+        arjun     = None
+        use_arjun = False
+        print("   ⚠️  No Model Arjun found. Using standard SL/VWAP exit.\n")
+
+    results            = []
+    all_detailed_trades = []
+    days               = sorted(feat_df["trade_date"].unique())
+
+    # ── Parallel Execution ──
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+
+    tasks = []
+    for trade_date in days:
+        date_str    = pd.to_datetime(trade_date).strftime('%Y-%m-%d')
+        day_feat    = feat_df[pd.to_datetime(feat_df["trade_date"]).dt.strftime('%Y-%m-%d') == date_str]
+        day_candles = candles[pd.to_datetime(candles["trade_date"]).dt.strftime('%Y-%m-%d') == date_str]
+        tasks.append((trade_date, day_feat, day_candles, use_ml, model, use_arjun, arjun, sl_multiplier))
+
+    max_workers = max(1, multiprocessing.cpu_count() - 1)
+    print(f"🚀 Dispatching {len(tasks)} days to {max_workers} processes (Parallel V2 Mode) ...")
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_worker_backtest_day_v2, *task) for task in tasks]
+        
+        completed = 0
+        for f in futures:
+            res = f.result()
+            completed += 1
+            if res:
+                results.append(res["summary"])
+                all_detailed_trades.extend(res["detailed_trades"])
+            
+            if completed % 10 == 0 or completed == len(tasks):
+                print(f"   Progress: {completed}/{len(tasks)} days processed ...")
 
     if not results:
         print("No backtest results.")

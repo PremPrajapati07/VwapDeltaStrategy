@@ -3,3 +3,4 @@ raw_data/
 venv/
 __pycache__/
 logs/
+temp/

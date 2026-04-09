@@ -20,10 +20,17 @@ import pandas as pd
 from collections import defaultdict
 from zoneinfo import ZoneInfo          # ✅ FIX: IST-aware time throughout
 
+
+import sys, os
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)
+os.chdir(project_root)
+
+
 import config
 import data_collector as dc
 import krishna_v2_model as ml
-import arjun_model
+import arjun_model_v3 as arjun_model
 import db
 import kite_auth
 import kotak_auth
@@ -456,8 +463,6 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
     except Exception as e:
         log.warning(f"Failed to fetch market context from DB: {e}")
 
-    baseline_920 = {}
-
     if should_resume and state:
         best_strike = state["strike"]
         initial_pv  = state["cum_pv"]
@@ -474,27 +479,18 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
             print(f"🤖 Waiting for {config.SCAN_TIME} AM IST … (current IST: {now_ist.strftime('%H:%M:%S')})")
             _wait_until_ist(scan_time_t)
 
+        print(f"🤖 Running ML model for strike selection … (IST: {_now_ist().strftime('%H:%M:%S')})")
+        
+        snapshot_920      = dc.get_live_snapshot(data_broker, strikes)
+        vwap_map          = vwap_tracker.get_all()
+
         try:
-            snapshot_920 = dc.get_live_snapshot(data_broker, strikes)
-            vwap_map     = vwap_tracker.get_all()
-            now_t        = now_ist.time()
-
-            # Build V2 Baseline (State required for dynamic features)
-            baseline_920 = {
-                int(r["strike"]): {
-                    "spot": float(r.get("synthetic_spot") or spot or 0),
-                    "straddle": float(r["straddle_price"]),
-                    "ce_oi": float(r.get("oi_ce", 0)),
-                    "pe_oi": float(r.get("oi_pe", 0)),
-                } for _, r in snapshot_920.iterrows()
-            }
-
             prediction   = ml.predict_best_strike_v2(
-                snapshot_df=snapshot_920, vwap_map=vwap_map,
-                baseline_920=baseline_920, current_time=now_t,
-                vix=vix, nifty_prev_change=nifty_prev_change, nifty_open_gap=nifty_open_gap,
-                trade_date=today, expiry_date=expiry
+                snapshot_df=snapshot_920, vix=vix,
+                nifty_prev_change=nifty_prev_change, nifty_open_gap=nifty_open_gap,
+                vwap_map=vwap_map, trade_date=today, expiry_date=expiry
             )
+            # Handle potential None or missing key from predict_best_strike
             best_strike = (prediction.get("best_strike") if prediction else None) or strikes[atm_idx]["strike"]
         except Exception as e:
             log.warning(f"ML prediction failed ({e}), falling back to ATM.")
@@ -628,7 +624,7 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
                 if config.REENTRY_ALLOWED and config.REENTRY_REEVALUATE_STRIKE:
                     selected_strike_info = _reevaluate_strike(
                         data_broker, strikes, vwap_tracker, vix,
-                        nifty_prev_change, nifty_open_gap, today, expiry, cumulative_pnl, baseline_920
+                        nifty_prev_change, nifty_open_gap, today, expiry, cumulative_pnl
                     )
                     if selected_strike_info is None:
                         print("🏁 Profit protection stopped further trades. Ending day.")
@@ -676,7 +672,7 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
                     if config.REENTRY_ALLOWED and config.REENTRY_REEVALUATE_STRIKE:
                         selected_strike_info = _reevaluate_strike(
                             data_broker, strikes, vwap_tracker, vix,
-                            nifty_prev_change, nifty_open_gap, today, expiry, cumulative_pnl, baseline_920
+                            nifty_prev_change, nifty_open_gap, today, expiry, cumulative_pnl
                         )
                         if selected_strike_info is None:
                             print("🏁 Profit protection stopped further trades. Ending day.")
@@ -695,7 +691,7 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
                 if config.REENTRY_ALLOWED and config.REENTRY_REEVALUATE_STRIKE:
                     selected_strike_info = _reevaluate_strike(
                         data_broker, strikes, vwap_tracker, vix,
-                        nifty_prev_change, nifty_open_gap, today, expiry, cumulative_pnl, baseline_920
+                        nifty_prev_change, nifty_open_gap, today, expiry, cumulative_pnl
                     )
                     if selected_strike_info is None:
                         print("🏁 Profit protection stopped further trades. Ending day.")
@@ -717,16 +713,14 @@ def run_live_trading(lots: int = 1, paper_trade: bool = True, skip_kite: bool = 
 # It is intentionally NOT redefined here to avoid overriding the correct definition.
 
 def _reevaluate_strike(data_broker, strikes, vwap_tracker, vix,
-                       prev_change, open_gap, today, expiry, cumulative_pnl=0.0, baseline_920=None):
+                       prev_change, open_gap, today, expiry, cumulative_pnl=0.0):
     snap     = dc.get_live_snapshot(data_broker, strikes)
     vwap_map = vwap_tracker.get_all()
     try:
-        now_ist = dt.datetime.now(IST).time()
         pred = ml.predict_best_strike_v2(
-            snapshot_df=snap, vwap_map=vwap_map, 
-            baseline_920=baseline_920 or {}, current_time=now_ist,
-            vix=vix, nifty_prev_change=prev_change, nifty_open_gap=open_gap,
-            trade_date=today, expiry_date=expiry
+            snapshot_df=snap, vix=vix,
+            nifty_prev_change=prev_change, nifty_open_gap=open_gap,
+            vwap_map=vwap_map, trade_date=today, expiry_date=expiry
         )
         conf = pred.get("confidence", 0.0) if pred else 0.0
         
